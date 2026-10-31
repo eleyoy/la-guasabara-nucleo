@@ -191,19 +191,35 @@ static std::vector<BurnRomInfo> WantedRoms(std::vector<std::string>* names)
 
 // Looks through rom_dir for the files the driver wants. Loose files are only read
 // when their size matches one of them, so a big ROM folder (Fightcade's) is quick.
+// Every file in dir and its subfolders, up to 3 levels down: unzipping often
+// leaves the files in a folder inside another one. A limit on how many it looks
+// at keeps a whole disk from being walked by mistake.
+template <class F> static bool ForEachFile(const fs::path& dir, F fn)
+{
+	std::error_code ec;
+	fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
+	if (ec) return false;
+	int seen = 0;
+	for (; it != end && seen < 20000; it.increment(ec), seen++) {
+		if (ec) { ec.clear(); continue; }
+		if (it->is_directory(ec) && it.depth() >= 3) it.disable_recursion_pending();
+		if (it->is_regular_file(ec)) fn(*it);
+	}
+	return true;
+}
+
 static void IndexRoms(const fs::path& dir)
 {
 	std::map<UINT32, UINT32> sizeByCrc;
 	for (auto& r : WantedRoms(NULL)) sizeByCrc[r.nCrc] = r.nLen;
-	std::error_code ec;
-	for (auto& e : fs::directory_iterator(dir, ec)) {
-		if (!e.is_regular_file(ec)) continue;
+	ForEachFile(dir, [&](const fs::directory_entry& e) {
+		std::error_code ec;
 		std::string ext = e.path().extension().string();
 		for (auto& c : ext) c = (char)tolower(c);
 		if (ext == ".zip") {
 			for (auto& z : ListZip(e.path()))
 				if (sizeByCrc.count(z.crc) && sizeByCrc[z.crc] == z.usize) g_romByCrc.emplace(z.crc, z.src);
-			continue;
+			return;
 		}
 		size_t n = (size_t)e.file_size(ec);
 		bool wanted = false;
@@ -213,7 +229,7 @@ static void IndexRoms(const fs::path& dir)
 			UINT32 crc = Crc32(d.data(), d.size());
 			if (sizeByCrc.count(crc)) g_romByCrc.emplace(crc, RomSource{ e.path(), false, 0, 0, 0, (UINT32)n });
 		}
-	}
+	});
 }
 
 static std::string g_missingRom;
@@ -374,37 +390,55 @@ int guasa_check_rom(const char* rom_dir, char* report, size_t report_len)
 	g_romByCrc.clear();
 	fs::path dir = fs::u8path(rom_dir);
 	IndexRoms(dir);
-	std::map<std::string, UINT32> crcByName;
-	std::error_code ec;
-	for (auto& e : fs::directory_iterator(dir, ec)) {
-		if (!e.is_regular_file(ec)) continue;
+	std::map<std::string, UINT32> crcByName;   // files with the right name, in zips or loose
+	std::map<std::string, bool> isWanted;
+	for (auto& n : names) isWanted[n] = true;
+	bool opened = ForEachFile(dir, [&](const fs::directory_entry& e) {
 		std::string ext = e.path().extension().string();
 		for (auto& c : ext) c = (char)tolower(c);
-		if (ext == ".zip") for (auto& z : ListZip(e.path())) crcByName.emplace(z.name, z.crc);
-	}
-	if (ec) { Fail(report, report_len, "No se pudo abrir la carpeta."); return -1; }
+		if (ext == ".zip") { for (auto& z : ListZip(e.path())) crcByName.emplace(z.name, z.crc); return; }
+		std::string name = e.path().filename().string();
+		std::vector<UINT8> d;
+		std::error_code ec;
+		if (isWanted.count(name) && ReadBytes(e.path(), 0, (size_t)e.file_size(ec), d)) crcByName.emplace(name, Crc32(d.data(), d.size()));
+	});
+	if (!opened) { Fail(report, report_len, "No se pudo abrir la carpeta."); return -1; }
 
-	int problems = 0;
+	// The game's own files are sfxj.* and ssf2xj.key (ssf2xjr1.zip); the rest are its
+	// parent's, ssf2t.zip (graphics and sound). Fightcade's ssf2xjr1.zip brings both.
+	int problems = 0, ownMissing = 0, ownTotal = 0, parentMissing = 0, wrong = 0;
+	std::string lines;
 	for (size_t i = 0; i < wanted.size(); i++) {
+		const std::string& n = names[i];
+		bool own = n.rfind("sfxj", 0) == 0 || n.rfind("ssf2xj", 0) == 0;
+		ownTotal += own;
 		if (g_romByCrc.count(wanted[i].nCrc)) continue;
 		problems++;
-		const std::string& n = names[i];
-		// The game's own files are sfxj.* and ssf2xj.key; the rest come from its parent, ssf2t.
-		bool own = n.rfind("sfxj", 0) == 0 || n.rfind("ssf2xj", 0) == 0;
 		char line[200];
 		auto found = crcByName.find(n);
-		if (found != crcByName.end())
+		if (found != crcByName.end()) {
+			wrong++;
 			snprintf(line, sizeof(line), "%s está, pero no es el correcto (CRC %08x, se espera %08x).\n",
 			         n.c_str(), found->second, wanted[i].nCrc);
-		else
+		} else {
+			(own ? ownMissing : parentMissing)++;
 			snprintf(line, sizeof(line), "Falta %s (va en %s).\n", n.c_str(), own ? "ssf2xjr1.zip" : "ssf2t.zip o en ssf2xjr1.zip");
-		out += line;
+		}
+		lines += line;
 	}
+	int parentTotal = (int)wanted.size() - ownTotal;
 	bool none = g_romByCrc.empty();
 	g_romByCrc.clear();
 	if (!problems) out = "Todo bien: están los " + std::to_string(wanted.size()) + " archivos del juego.\n";
-	else if (none)   // nothing of the game here: one line instead of the whole list
+	else if (none && !wrong)   // nothing of the game here: one line instead of the whole list
 		out = "En esta carpeta no está el juego. Busca ssf2xjr1.zip (y ssf2t.zip, si lo tienes aparte).\n";
+	else if (!wrong && !ownMissing && parentMissing == parentTotal)
+		out = "Encontré ssf2xjr1.zip, pero a ese juego le falta ssf2t.zip, que trae los gráficos y el sonido. "
+		      "Pon ssf2t.zip en la misma carpeta, o usa el ssf2xjr1.zip de Fightcade, que ya trae todo.\n";
+	else if (!wrong && !parentMissing && ownMissing == ownTotal)
+		out = "Encontré ssf2t.zip, pero falta ssf2xjr1.zip, que es el juego en sí. Ponlo en la misma carpeta.\n";
+	else
+		out = lines;
 	Fail(report, report_len, out);
 	return problems;
 }
