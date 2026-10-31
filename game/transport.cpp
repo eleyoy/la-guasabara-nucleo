@@ -248,7 +248,7 @@ bool Transport::Negotiate(std::string* error)
 	reg.insert(reg.end(), m_cfg.token.begin(), m_cfg.token.end());
 	uint64_t start = NowMs(), lastReg = 0;
 	while (!m_peer.set) {
-		if (NowMs() - start > 20000) {
+		if (NowMs() - start > 40000) {   // time for the Windows firewall question the first time
 			if (error) *error = "el otro jugador no llegó (ni por el servidor)";
 			return false;
 		}
