@@ -211,8 +211,9 @@ template <class F> static bool ForEachFile(const fs::path& dir, F fn)
 static void IndexRoms(const fs::path& dir)
 {
 	std::map<UINT32, UINT32> sizeByCrc;
-	for (auto& r : WantedRoms(NULL)) sizeByCrc[r.nCrc] = r.nLen;
-	ForEachFile(dir, [&](const fs::directory_entry& e) {
+	std::vector<std::string> names;
+	for (auto& r : WantedRoms(&names)) sizeByCrc[r.nCrc] = r.nLen;
+	auto look = [&](const fs::directory_entry& e) {
 		std::error_code ec;
 		std::string ext = e.path().extension().string();
 		for (auto& c : ext) c = (char)tolower(c);
@@ -229,7 +230,18 @@ static void IndexRoms(const fs::path& dir)
 			UINT32 crc = Crc32(d.data(), d.size());
 			if (sizeByCrc.count(crc)) g_romByCrc.emplace(crc, RomSource{ e.path(), false, 0, 0, 0, (UINT32)n });
 		}
-	});
+	};
+	// First the files the game comes in: a whole collection (Fightcade's ROMs
+	// folder has thousands of zips, maybe on a slow disk) isn't read if those
+	// bring everything.
+	std::vector<std::string> first = { "ssf2xjr1.zip", "ssf2t.zip" };
+	first.insert(first.end(), names.begin(), names.end());
+	for (auto& n : first) {
+		std::error_code ec;
+		fs::directory_entry e(dir / n, ec);
+		if (!ec && e.is_regular_file(ec)) look(e);
+	}
+	if (g_romByCrc.size() < sizeByCrc.size()) ForEachFile(dir, look);
 }
 
 static std::string g_missingRom;
@@ -393,7 +405,10 @@ int guasa_check_rom(const char* rom_dir, char* report, size_t report_len)
 	std::map<std::string, UINT32> crcByName;   // files with the right name, in zips or loose
 	std::map<std::string, bool> isWanted;
 	for (auto& n : names) isWanted[n] = true;
-	bool opened = ForEachFile(dir, [&](const fs::directory_entry& e) {
+	std::map<UINT32, bool> crcs;
+	for (auto& w : wanted) crcs[w.nCrc] = true;
+	bool complete = g_romByCrc.size() == crcs.size();   // then the names aren't needed
+	bool opened = complete || ForEachFile(dir, [&](const fs::directory_entry& e) {
 		std::string ext = e.path().extension().string();
 		for (auto& c : ext) c = (char)tolower(c);
 		if (ext == ".zip") { for (auto& z : ListZip(e.path())) crcByName.emplace(z.name, z.crc); return; }
