@@ -1,0 +1,8 @@
+# Values every PC must give (run_all.py). Checked on 2026-10-29 on Windows
+# (the organizer's PC), Linux (Ryzen mini PC) and SteamOS (Steam machine,
+# with Fightcade's ssf2xjr1.zip). A change in the core that changes these
+# changes the game: it needs the certification again (core/cert/).
+starting_state 450f108a23a6c503
+starting_game efdcf29632bbd416
+# SHA-256 of the 3600 lines of "core_test <roms> hashes 3600" (LF line ends)
+hashes_3600 765702fea63a3bfff26b6db6f7bd02fba4c7ccd780a0431d94d77ca07c1b424d

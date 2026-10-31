@@ -1,0 +1,17 @@
+diff --git a/src/burn/drv/capcom/qs_c.cpp b/src/burn/drv/capcom/qs_c.cpp
+index c3335b7..891eb8b 100644
+--- a/src/burn/drv/capcom/qs_c.cpp
++++ b/src/burn/drv/capcom/qs_c.cpp
+@@ -914,3 +914,12 @@ INT32 QscUpdate(INT32 nEnd)
+ 
+ 	return 0;
+ }
++
++// La Guasabara: resampler phase and interpolation history. QscScan() leaves them
++// out, so after a state load the chip can run a different number of steps.
++// Separate from QscScan() so Fightcade's state layout stays the same.
++void QscScanResampler(INT32 nAction)
++{
++	SCAN_VAR(nDelta);
++	SCAN_VAR(interpolate_buffer);
++}

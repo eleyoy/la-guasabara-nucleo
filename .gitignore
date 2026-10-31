@@ -1,0 +1,12 @@
+# Never: the game's files, keys or saved states
+*.zip
+*.7z
+*.key
+*.fs
+*.nv
+*.hi
+# What the build downloads or makes
+spike/build/
+spike/tools/
+spike/third_party/
+__pycache__/
