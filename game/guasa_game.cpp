@@ -507,6 +507,9 @@ static int PlayOnline(const char* roms, const NetConfig& cfg)
 	Uint64 next = SDL_GetTicksNS(), endedAt = 0;
 	bool quit = false, showInputs = false, wasPlaying = false;
 	int shownDelay = -1;
+	double pingSum = 0, jitterSum = 0;   // for the summary the hub keeps (average while playing)
+	int pingN = 0;
+	unsigned pingMax = 0;
 	while (!quit) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
@@ -538,6 +541,10 @@ static int PlayOnline(const char* roms, const NetConfig& cfg)
 		if (shown) {
 			PushAudio();
 			if (int w = results.Update()) { printf("resultado %d\n", w); fflush(stdout); }
+			if (st == NetMatch::Playing && stats.ping) {
+				pingSum += stats.ping; jitterSum += stats.jitter; pingN++;
+				if (stats.ping > pingMax) pingMax = stats.ping;
+			}
 		}
 		if (leave) quit = true;
 		if (st == NetMatch::Playing && !wasPlaying) { printf("empezo la partida\n"); fflush(stdout); wasPlaying = true; }
@@ -561,8 +568,10 @@ static int PlayOnline(const char* roms, const NetConfig& cfg)
 		else if (now - next > 5 * frameNs) next = now;
 	}
 	const NetStats& s = net.Stats();
-	printf("resumen: %d cuadros; ping %u ms; delay %d; %d rollbacks (el mas largo %d); desincronizaciones %d\n",
-	       s.frame, s.ping, s.delay, s.rollbacks, s.maxRollback, s.desyncs);
+	// one line the app passes to the hub, so the admin sees how every set went
+	printf("resumen cuadros=%d ping=%.0f pingmax=%u jitter=%.0f delay=%d rollbacks=%d rollbackmax=%d desincronizaciones=%d primera=%d ruta=%s\n",
+	       s.frame, pingN ? pingSum / pingN : 0.0, pingMax, pingN ? jitterSum / pingN : 0.0, s.delay, s.rollbacks, s.maxRollback,
+	       s.desyncs, s.firstDesync, net.Relayed() ? "servidor" : "directa");
 	fflush(stdout);
 	net.Stop();
 	CloseAll();

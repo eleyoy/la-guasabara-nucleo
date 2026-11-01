@@ -38,6 +38,7 @@ public:
 	// already be at its starting state (guasa_boot_to_select), the same on both PCs.
 	bool Start(const NetConfig& cfg, std::string* error);
 	std::string RouteText() const { return m_transport.Describe(); }
+	bool Relayed() const { return m_transport.route() == Transport::Relay; }
 
 	// One frame: sends this PC's buttons, runs what GekkoNet asks (save, load,
 	// advance, including rollbacks). draw: draw the frames that will be shown.
