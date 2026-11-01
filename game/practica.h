@@ -72,6 +72,8 @@ private:
 	std::vector<uint8_t> m_select, m_spot;
 	std::deque<uint16_t> m_late;
 	uint16_t m_lastLocal = 0;
+	uint16_t m_held = 0;            // held since the last pick: kept from the game until released
+	bool m_grabHeld = false;
 	int m_lastLife[2] = { kFullLife, kFullLife }, m_still[2] = { 0, 0 };
 	int m_blockFor = 0;
 	bool m_tapeOnRight = true;

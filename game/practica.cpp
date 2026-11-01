@@ -66,13 +66,19 @@ void Practice::Inputs(uint16_t local, int second, uint16_t out[2])
 	uint16_t pressed = local & ~m_lastLocal;
 	m_lastLocal = local;
 	out[0] = out[1] = 0;
+	// At character select, what was already held (the button that picked the
+	// player's character, or the menu's) doesn't reach the game until it's
+	// released: otherwise the rival's cursor would pick at once (Ken).
+	if (m_grabHeld) { m_held = local; m_grabHeld = false; }
+	m_held &= local;
+	uint16_t fresh = local & ~m_held;
 	if (phase == PickMine) {
-		out[0] = local;
-		if (pressed & kButtons) phase = PickRival;
+		out[0] = fresh;
+		if (pressed & kButtons) { phase = PickRival; m_held = local; }
 		return;
 	}
 	if (phase == PickRival) {
-		out[1] = local;
+		out[1] = fresh;
 		if (pressed & kButtons) phase = WaitFight;
 		return;
 	}
@@ -164,6 +170,7 @@ void Practice::ChangeCharacters()
 	if (m_select.empty()) return;
 	guasa_load(m_select.data(), m_select.size());
 	phase = PickMine;
+	m_grabHeld = true;
 	m_spot.clear();
 	tape.clear();
 	rec = NoRec;

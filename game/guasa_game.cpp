@@ -726,6 +726,9 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 	int noteFrames = 0;
 	auto say = [&](const std::string& t) { note = t; noteFrames = 120; };
 	bool quit = false, menuOpen = false;
+	// A second control moves the rival only when asked for in the menu: some
+	// controls (the 8BitDo) show up twice, and the rival would copy the player.
+	bool secondControl = false;
 	int sel = 0;
 	uint16_t lastLocal = 0;
 	auto yesNo = [](bool b) { return std::string(b ? "si" : "no"); };
@@ -739,6 +742,8 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 			  [&](int) { P.ToggleRecord(); menuOpen = false; } },
 			{ "Repetir la grabacion: " + yesNo(P.replay), "F6", [&](int) { if (!P.tape.empty()) P.replay = !P.replay; } },
 			{ "Mover al rival tu mismo: " + yesNo(P.controlRival), "F3", [&](int) { if (P.rec == Practice::NoRec) P.controlRival = !P.controlRival; } },
+			{ "Rival con otro control: " + (g_devs.size() < 2 ? std::string("no hay") : yesNo(secondControl)), "",
+			  [&](int) { secondControl = !secondControl && g_devs.size() >= 2; } },
 			{ "Vida que se recupera: " + yesNo(P.refillLife), "", [&](int) { P.refillLife = !P.refillLife; } },
 			{ "Tiempo infinito: " + yesNo(P.freezeClock), "", [&](int) { P.freezeClock = !P.freezeClock; } },
 			{ "Super siempre llena: " + yesNo(P.fullSuper), "", [&](int) { P.fullSuper = !P.fullSuper; } },
@@ -799,9 +804,10 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 			if (k == 236) in[0] = GUASA_DOWN;
 			if (k == 240) { buildMenu(); DrawPractice(P, &menu, 1, ""); SaveWindow(shots + "/practica-menu.bmp"); quit = true; }
 		}
-		uint16_t local = in[0], pressed = local & ~lastLocal;
+		if (g_devs.size() < 2) secondControl = false;
+		int second = secondControl ? in[1] : -1;
+		uint16_t local = secondControl ? in[0] : in[0] | in[1], pressed = local & ~lastLocal;
 		lastLocal = local;
-		int second = g_devs.size() >= 2 ? in[1] : -1;   // a second control moves the rival itself
 
 		// MONEDA opens and closes the menu; START goes back to the saved position
 		if (pressed & GUASA_COIN) { menuOpen = !menuOpen; sel = 0; }
@@ -854,12 +860,19 @@ static int PracticeSelfTest(const char* roms)
 	auto run = [&](int n, uint16_t local) { for (int i = 0; i < n; i++) frame(local); };
 	auto life2 = [] { return (int)(int16_t)ReadWord(kP2 + kLife); };
 	auto x2 = [] { return (int)ReadWord(kP2 + kX); };
+	auto char2 = [] { return (int)guasa_read_ram(kP2 + 0x391); };
+	// the rival's cursor moves one way, then the rival is picked (the button that
+	// picked the player's character, still held, must not pick it)
+	auto pickRival = [&](uint16_t dir) {
+		run(4, dir); run(10, 0); run(4, GUASA_LP);
+		int f = 0;
+		while (P.phase != Practice::Fight && f++ < 4000) frame(0);
+		return f;
+	};
 
 	run(30, 0); run(4, GUASA_LP); run(30, 0);
 	check(P.phase == Practice::PickRival, "con el primer golpe se elige tu personaje y sigue el del rival");
-	run(4, GUASA_LP);
-	int f = 0;
-	while (P.phase != Practice::Fight && f++ < 4000) frame(0);
+	int f = pickRival(GUASA_RIGHT), rivalRight = char2();
 	check(P.phase == Practice::Fight && P.HasPosition(), "empieza la pelea y queda guardada la posicion", std::to_string(f) + " cuadros");
 
 	// an attack against a rival that blocks, and against one that stands
@@ -902,6 +915,11 @@ static int PracticeSelfTest(const char* roms)
 	check(!P.history[0].empty() && (P.history[0].front().in & GUASA_UP), "el historial muestra el ultimo boton");
 	P.ChangeCharacters();
 	check(P.phase == Practice::PickMine && !P.HasPosition(), "cambiar de personajes vuelve a la seleccion");
+	run(30, 0); run(4, GUASA_LP); run(30, 0);
+	pickRival(GUASA_LEFT);
+	int rivalLeft = char2();
+	check(P.phase == Practice::Fight && rivalLeft != rivalRight, "el rival es el que elige el jugador, no el del cursor",
+	      "derecha " + std::to_string(rivalRight) + ", izquierda " + std::to_string(rivalLeft));
 	guasa_exit();
 	return fails ? 1 : 0;
 }
