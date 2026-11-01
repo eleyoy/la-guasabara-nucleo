@@ -67,6 +67,9 @@ uint64_t guasa_game_hash(void);
 
 /* One byte of the 68000's work RAM, 0xFF0000-0xFFFFFF (appendix C). */
 uint8_t guasa_read_ram(uint32_t address);
+/* Changes one byte of it. Practice mode only (infinite life and time): never
+ * online, where both machines must run exactly the same game. */
+void guasa_write_ram(uint32_t address, uint8_t value);
 
 /* The last drawn frame: RGB565, width x height, pitch in bytes. */
 const uint16_t* guasa_framebuffer(int* width, int* height, int* pitch);

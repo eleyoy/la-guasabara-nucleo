@@ -120,6 +120,56 @@ int main(int argc, char** argv)
 		return r;
 	}
 
+	if (mode == "explore") {
+		// For practice mode: picks the first characters, waits for the fight, then
+		// P1 walks right and left. Prints the words of P1's block (FF844E) that
+		// follow the walk, and life, clock and the start flag along the way.
+		guasa_boot_to_select();
+		uint16_t in[2] = { 0, 0 };
+		auto run = [&](int frames, uint16_t p1, uint16_t p2) { for (int f = 0; f < frames; f++) { in[0] = p1; in[1] = p2; guasa_run_frame(in, 0); } };
+		auto word = [](uint32_t a) { return (uint16_t)(guasa_read_ram(a) << 8 | guasa_read_ram(a + 1)); };
+		run(30, 0, 0); run(4, GUASA_LP, GUASA_LP); run(30, 0, 0); run(4, GUASA_LP, GUASA_LP);
+		int f = 0;
+		for (; f < 3000 && guasa_read_ram(0xFF8DCF) != 0x99; f++) run(1, 0, 0);
+		run(240, 0, 0);
+		printf("fight after %d frames; clock %02x; life P1 %02x%02x P2 %02x%02x; chars %02x %02x\n", f, guasa_read_ram(0xFF8DCE),
+		       guasa_read_ram(0xFF844E + 0x2A), guasa_read_ram(0xFF844E + 0x2B), guasa_read_ram(0xFF884E + 0x2A), guasa_read_ram(0xFF884E + 0x2B),
+		       guasa_read_ram(0xFF844E + 0x391), guasa_read_ram(0xFF884E + 0x391));
+		std::vector<uint16_t> a(0x200), b(0x200), c(0x200);
+		for (int i = 0; i < 0x200; i++) a[i] = word(0xFF844E + 2 * i);
+		run(60, GUASA_RIGHT, 0);
+		for (int i = 0; i < 0x200; i++) b[i] = word(0xFF844E + 2 * i);
+		run(60, GUASA_LEFT, 0);
+		for (int i = 0; i < 0x200; i++) c[i] = word(0xFF844E + 2 * i);
+		for (int i = 0; i < 0x200; i++)
+			if (b[i] > a[i] && c[i] < b[i] && b[i] - a[i] < 400)
+				printf("P1 +%03x: %04x -> %04x -> %04x   P2 same place %04x\n", 2 * i, a[i], b[i], c[i], word(0xFF884E + 2 * i));
+		// then P1 walks up to P2 and attacks: bytes that only grow (super meter, the
+		// rival's dizziness) while P2's life goes down
+		std::vector<uint8_t> s1(0x800), s2(0x800);
+		auto snap = [&](std::vector<uint8_t>& s) { for (int i = 0; i < 0x800; i++) s[i] = guasa_read_ram(0xFF844E + i); };
+		snap(s1);
+		std::vector<int> grew(0x800, 0), shrank(0x800, 0);
+		run(40, GUASA_RIGHT, 0);
+		for (int k = 0; k < 40; k++) {
+			std::vector<uint8_t> before(0x800);
+			snap(before);
+			run(3, GUASA_RIGHT | GUASA_HP, 0); run(12, GUASA_RIGHT, 0); run(3, GUASA_DOWN | GUASA_RIGHT, 0); run(3, GUASA_RIGHT | GUASA_HP, 0); run(12, 0, 0);
+			snap(s2);
+			for (int i = 0; i < 0x800; i++) { grew[i] += s2[i] > before[i]; shrank[i] += s2[i] < before[i]; }
+		}
+		printf("life after attacks: P1 %02x P2 %02x\n", guasa_read_ram(0xFF844E + 0x2B), guasa_read_ram(0xFF884E + 0x2B));
+		for (int i = 0; i < 0x800; i++)
+			if (grew[i] >= 3 && shrank[i] == 0 && s2[i] > s1[i])
+				printf("%s +%03x: %02x -> %02x (grew %d times)\n", i < 0x400 ? "P1" : "P2", i & 0x3FF, s1[i], s2[i], grew[i]);
+		run(1, 0, 0);
+		in[0] = in[1] = 0;
+		guasa_run_frame(in, 1);
+		SaveBmp(argc > 3 ? argv[3] : "explore.bmp");
+		guasa_exit();
+		return 0;
+	}
+
 	if (mode == "state") {
 		guasa_boot_to_select();
 		std::vector<uint8_t> buf(guasa_state_size());

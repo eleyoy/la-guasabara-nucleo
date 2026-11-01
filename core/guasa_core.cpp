@@ -526,6 +526,11 @@ uint8_t guasa_read_ram(uint32_t address)
 	return CpsRamFF[(address & 0xFFFF) ^ 1];   // stored as little-endian 16-bit words
 }
 
+void guasa_write_ram(uint32_t address, uint8_t value)
+{
+	CpsRamFF[(address & 0xFFFF) ^ 1] = value;
+}
+
 const uint16_t* guasa_framebuffer(int* width, int* height, int* pitch)
 {
 	if (width) *width = g_w;

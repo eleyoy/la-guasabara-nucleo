@@ -60,9 +60,10 @@ def main():
 
     if sb.WINDOWS and os.path.isdir(sb.SDL):
         game = cb.compile_cpp(os.path.join(HERE, "guasa_game.cpp"), ["-I" + os.path.join(sb.SDL, "include")])
-        if game is None:
+        practice = cb.compile_cpp(os.path.join(HERE, "practica.cpp"))
+        if game is None or practice is None:
             return 1
-        ok = link(os.path.join(cb.OUT, "guasa-game.exe"), common + [game],
+        ok = link(os.path.join(cb.OUT, "guasa-game.exe"), common + [game, practice],
                   ["-L" + os.path.join(sb.SDL, "lib"), "-lSDL3", "-lshell32"]) and ok
         shutil.copy(os.path.join(sb.SDL, "bin", "SDL3.dll"), cb.OUT)
     return 0 if ok else 1
