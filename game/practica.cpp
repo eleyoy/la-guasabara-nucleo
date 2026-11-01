@@ -119,7 +119,12 @@ void Practice::AfterFrame(const uint16_t used[2])
 			m_still[p] = life == m_lastLife[p] ? m_still[p] + 1 : 0;
 			m_lastLife[p] = life;
 			// a second without being hit: full again (not on a K.O., which ends the round)
-			if (refillLife && life > 0 && life < kFullLife && m_still[p] >= 60) { WriteWord(at, kFullLife); m_lastLife[p] = kFullLife; }
+			// The game keeps life in three places; writing only the first one, it sees
+			// them differ and takes it for a new hit (the rival fell down again).
+			if (refillLife && life > 0 && life < kFullLife && m_still[p] >= 60) {
+				for (uint32_t copy : { kLife, kLifeCopy, kLifeBar }) WriteWord((p ? kP2 : kP1) + copy, kFullLife);
+				m_lastLife[p] = kFullLife;
+			}
 		}
 	}
 	for (int p = 0; p < 2; p++) {

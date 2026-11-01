@@ -21,6 +21,7 @@
 enum : uint32_t {
 	kP1 = 0xFF844E, kP2 = 0xFF884E,   // each player's block
 	kLife = 0x2A,                     // word; 0x90 full
+	kLifeCopy = 0x2C, kLifeBar = 0x1BC,   // the same life, kept twice more (all three go together)
 	kX = 0x06,                        // word; position on the stage
 	kSuper = 0x39C,                   // byte; 0x90 full
 	kClock = 0xFF8DCE,                // BCD; 0x99 during the round's intro, 0x98 once the fight runs

@@ -889,6 +889,22 @@ static int PracticeSelfTest(const char* roms)
 	check(hit < kFullLife, "el rival de pie si recibe los golpes", "vida minima " + std::to_string(hit));
 	run(90, 0);
 	check(life2() == kFullLife, "la vida vuelve a llenarse", std::to_string(life2()));
+	check(ReadWord(kP2 + kLifeCopy) == kFullLife && ReadWord(kP2 + kLifeBar) == kFullLife, "las tres copias de la vida se llenan juntas");
+
+	// a knockdown with the life refilling plays out like one without: the rival gets
+	// up once (refilling only the first copy made it fall down again)
+	auto knockdown = [&](bool refill) {
+		P.LoadPosition();
+		P.refillLife = refill;
+		run(100, GUASA_RIGHT);
+		run(4, GUASA_DOWN | GUASA_HK);
+		std::string moves;
+		for (int i = 0; i < 300; i++) { frame(0); moves += std::to_string(x2()) + "," + std::to_string(ReadWord(kP2 + 0x0A)) + " "; }
+		return moves;
+	};
+	std::string without = knockdown(false), with = knockdown(true);
+	P.refillLife = true;
+	check(with == without, "derribado, el rival se levanta igual con la vida que se recupera");
 	check(guasa_read_ram(kClock) == 0x99, "el reloj se queda en 99");
 
 	// record the rival walking forward, then it repeats it from the same position
