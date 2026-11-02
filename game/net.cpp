@@ -51,6 +51,7 @@ bool ParseNetArg(const char* a, NetConfig& cfg)
 	else if (!strncmp(a, "loss=", 5)) cfg.lossPct = atoi(a + 5);
 	else if (!strncmp(a, "relay=", 6)) cfg.relay = a + 6;
 	else if (!strcmp(a, "relayonly")) cfg.relayOnly = true;
+	else if (!strcmp(a, "pausa")) cfg.pause = true;
 	else if (!strncmp(a, "token=", 6)) {
 		cfg.token.clear();
 		for (const char* p = a + 6; p[0] && p[1]; p += 2) {
@@ -99,7 +100,7 @@ bool NetMatch::Start(const NetConfig& cfg, std::string* error)
 	gc.max_spectators = 0;
 	gc.max_input_prediction_window = 8;
 	gc.input_size = sizeof(uint16_t);
-	gc.state_size = (unsigned int)guasa_state_size();
+	gc.state_size = (unsigned int)(guasa_state_size() + sizeof(PauseState));   // the game, then the pause
 	gc.desync_detection = true;
 	gekko_start(m_session, &gc);
 	gekko_net_adapter_set(m_session, &g_adapter);
@@ -149,13 +150,20 @@ NetMatch::Status NetMatch::Step(uint16_t localInput, bool draw, bool* shown)
 		GekkoGameEvent* e = up[i];
 		if (e->type == GekkoSaveEvent) {
 			size_t len = guasa_save(e->data.save.state, guasa_state_size());
+			memcpy(e->data.save.state + len, &m_pause, sizeof(PauseState));
+			len += sizeof(PauseState);
 			*e->data.save.state_len = (unsigned int)len;
 			*e->data.save.checksum = (unsigned int)guasa_xxh64(e->data.save.state, len);
 		} else if (e->type == GekkoLoadEvent) {
-			guasa_load(e->data.load.state, e->data.load.state_len);
+			unsigned int len = e->data.load.state_len - (unsigned int)sizeof(PauseState);
+			guasa_load(e->data.load.state, len);
+			memcpy(&m_pause, e->data.load.state + len, sizeof(PauseState));
 		} else if (e->type == GekkoAdvanceEvent) {
-			const uint16_t* in = (const uint16_t*)e->data.adv.inputs;
+			const uint16_t* raw = (const uint16_t*)e->data.adv.inputs;
+			uint16_t in[2] = { (uint16_t)(raw[0] & ~kPauseBit), (uint16_t)(raw[1] & ~kPauseBit) };
 			bool rolling = e->data.adv.rolling_back;
+			// paused: the game doesn't move this frame (the same on both PCs)
+			if (PauseFrame(raw)) { m_stats.frame = e->data.adv.frame; if (shown && !rolling) *shown = true; continue; }
 			// draw only frames that are shown; drawing doesn't change the state
 			guasa_run_frame(in, draw && !rolling);
 			if (rolling) { m_stats.resimulated++; m_run++; continue; }
@@ -185,6 +193,27 @@ NetMatch::Status NetMatch::Step(uint16_t localInput, bool draw, bool* shown)
 	}
 	m_stats.framesAhead = gekko_frames_ahead(m_session);
 	return m_stats.started ? Playing : Waiting;
+}
+
+// One frame of the pause's rules, from both players' buttons. True = the game
+// stays still this frame.
+bool NetMatch::PauseFrame(const uint16_t in[2])
+{
+	const int fps = (int)(guasa_fps() + 0.5);
+	bool asked[2] = { (in[0] & kPauseBit) != 0, (in[1] & kPauseBit) != 0 };
+	switch (m_pause.phase) {
+	case 0:
+		if (!m_cfg.pause || !(asked[0] || asked[1])) return false;
+		m_pause = { 1, asked[0] ? 0 : 1, 0 };
+		return true;
+	case 1:
+		if (++m_pause.frames >= 5 * 60 * fps) m_pause = { 2, m_pause.by, 10 * fps };   // 5 minutes: 10 s and on
+		else if ((asked[0] || asked[1]) && m_pause.frames > fps / 2) m_pause = { 2, m_pause.by, 3 * fps };   // asked to go on: 3 s
+		return true;
+	default:
+		if (--m_pause.frames <= 0) m_pause = PauseState();
+		return true;
+	}
 }
 
 double NetMatch::PaceFactor() const

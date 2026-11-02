@@ -16,8 +16,10 @@
 // Online also: F2 shows the buttons, F5 / F6 = less / more delay, F7 / F8 = mute
 // my microphone / the rival (voice chat, handled by the interface), Esc leaves.
 // Online, for the interface: "resultado 1|2" on stdout when a game ends, "voz mic"
-// and "voz rival" for F7 and F8; on stdin "salir" closes the window (the set is
-// over) and "voz estado mic=on|off rival=on|off|nada" updates the voice indicator.
+// and "voz rival" for F7 and F8, "mensaje <text>" for a message to the rival (T);
+// on stdin "salir" closes the window (the set is over), "voz estado mic=on|off
+// rival=on|off|nada" updates the voice indicator and "mensaje <name>\t<text>"
+// shows a message (":id:" is one of the league's emojis).
 // Every match starts from the starting state generated here (guasa_boot_to_select),
 // and the window keeps the game's own pace, 59.63 frames per second.
 
@@ -36,6 +38,8 @@
 #include <functional>
 #include <thread>
 #include <iostream>
+#include <mutex>
+#include <deque>
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
@@ -290,6 +294,8 @@ static void DrawInputs(const SDL_FRect& r, const uint16_t raw[2])
 
 static void DrawStats(const NetStats& st, int local);
 
+static std::function<void(const SDL_FRect&)> g_overlay;   // drawn last (messages in online sets)
+
 static void Present(const uint16_t* raw, const char* banner, const NetStats* stats = NULL, int local = 0)
 {
 	SDL_UpdateTexture(g_tex, NULL, guasa_framebuffer(NULL, NULL, NULL), g_w * 2);
@@ -310,6 +316,7 @@ static void Present(const uint16_t* raw, const char* banner, const NetStats* sta
 		Text(r.x + 12 * s, box.y + 16 * s, s * 1.5f, first.c_str(), 255, 220, 120);
 		if (nl) Text(r.x + 12 * s, box.y + 50 * s, s, nl + 1);
 	}
+	if (g_overlay) g_overlay(r);
 	SDL_RenderPresent(g_ren);
 }
 
@@ -485,7 +492,143 @@ static void DrawStats(const NetStats& st, int local)
 	if (st.desyncs) Text(r.x + r.w - 150 * s, r.y + 3 * s, s, "DESINCRONIZADO", 255, 80, 80);
 }
 
-static int PlayOnline(const char* roms, const NetConfig& cfg)
+// ---------------------------------------------------------------------------
+// Messages during the set: the league's emojis, quick phrases or a few words.
+
+static const char* kEmojis[] = { "aguantala", "calma-fiera", "coje-tu-palo", "ggs", "palomo", "que-e-leon",
+	"se-cayo-el-sistema", "vamo-al-game", "y-ahora" };
+static const char* kPhrases[] = { "GG", "Espera, por favor", "Una mas?", "Ya vuelvo", "Buena esa" };
+
+// The window's letters are plain ASCII: accents and the like are written without them.
+static std::string Plain(const std::string& u)
+{
+	static const struct { const char* from; char to; } fold[] = {
+		{ "\xC3\xA1", 'a' }, { "\xC3\xA9", 'e' }, { "\xC3\xAD", 'i' }, { "\xC3\xB3", 'o' }, { "\xC3\xBA", 'u' }, { "\xC3\xBC", 'u' },
+		{ "\xC3\xB1", 'n' }, { "\xC3\x81", 'A' }, { "\xC3\x89", 'E' }, { "\xC3\x8D", 'I' }, { "\xC3\x93", 'O' }, { "\xC3\x9A", 'U' },
+		{ "\xC3\x91", 'N' }, { "\xC2\xA1", '!' }, { "\xC2\xBF", '?' },
+	};
+	std::string out;
+	for (size_t i = 0; i < u.size();) {
+		bool done = false;
+		for (auto& f : fold)
+			if (!u.compare(i, 2, f.from)) { out += f.to; i += 2; done = true; break; }
+		if (done) continue;
+		unsigned char c = (unsigned char)u[i];
+		if (c < 0x80) { if (c >= 32) out += (char)c; i++; }
+		else { i++; while (i < u.size() && ((unsigned char)u[i] & 0xC0) == 0x80) i++; }   // anything else: left out
+	}
+	return out;
+}
+
+// An emoji's picture, from the "emojis" folder next to the game (loaded once).
+static SDL_Texture* EmojiTexture(const std::string& id)
+{
+	static std::map<std::string, SDL_Texture*> cache;
+	auto it = cache.find(id);
+	if (it != cache.end()) return it->second;
+	SDL_Texture* t = NULL;
+	if (SDL_Surface* sf = SDL_LoadPNG((std::string(SDL_GetBasePath()) + "emojis/" + id + ".png").c_str())) {
+		t = SDL_CreateTextureFromSurface(g_ren, sf);
+		SDL_DestroySurface(sf);
+	}
+	cache[id] = t;
+	return t;
+}
+
+// The emoji's id when the text is just ":id:" of one of them, else "".
+static std::string EmojiOf(const std::string& text)
+{
+	if (text.size() < 3 || text.front() != ':' || text.back() != ':') return "";
+	std::string id = text.substr(1, text.size() - 2);
+	for (const char* e : kEmojis) if (id == e) return id;
+	return "";
+}
+
+struct ShownMessage { std::string from, text; Uint64 at; };
+
+// The last messages, top right, each for 6 seconds.
+static void DrawMessages(const SDL_FRect& r, std::deque<ShownMessage>& list)
+{
+	Uint64 now = SDL_GetTicksNS();
+	while (!list.empty() && now - list.front().at > 6000000000ULL) list.pop_front();
+	float s = r.h / 450 > 1 ? r.h / 450 : 1, y = r.y + 20 * s;
+	for (auto& m : list) {
+		std::string id = EmojiOf(m.text), text = id.empty() ? Plain(m.text) : "";
+		float big = id.empty() ? 0 : 56 * s, w = SDL_max(Plain(m.from).size() * 8 * s, text.size() * 8 * s) + big + 16 * s;
+		float h = SDL_max(big, 22 * s) + 8 * s;
+		SDL_FRect box{ r.x + r.w - w - 8 * s, y, w, h };
+		SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+		SDL_SetRenderDrawColor(g_ren, 10, 10, 18, 200);
+		SDL_RenderFillRect(g_ren, &box);
+		SDL_SetRenderDrawColor(g_ren, 255, 46, 136, 255);
+		SDL_FRect bar{ box.x, box.y, 3 * s, h };
+		SDL_RenderFillRect(g_ren, &bar);
+		Text(box.x + 8 * s, box.y + 5 * s, s, Plain(m.from).c_str(), 255, 150, 200);
+		if (!id.empty()) {
+			if (SDL_Texture* t = EmojiTexture(id)) { SDL_FRect d{ box.x + w - big - 4 * s, box.y + 4 * s, big, big }; SDL_RenderTexture(g_ren, t, NULL, &d); }
+		} else Text(box.x + 8 * s, box.y + 16 * s, s, text.c_str(), 240, 240, 240);
+		y += h + 6 * s;
+	}
+}
+
+// The panel to send one (T): 9 emojis, the quick phrases and a line to type.
+struct MessagePanel {
+	bool open = false;
+	int sel = 0;                 // 0-8 emojis, 9-13 phrases, 14 the line
+	std::string typed;
+	static constexpr int kCount = 9 + 5 + 1;
+	struct Layout { SDL_FRect box, items[kCount]; float s; };
+	static Layout Lay(const SDL_FRect& r)
+	{
+		Layout L;
+		L.s = r.h / 450 > 1 ? r.h / 450 : 1;
+		float s = L.s, cell = 52 * s, w = 3 * cell + 230 * s, h = 3 * cell + 70 * s;
+		L.box = { r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, w, h };
+		for (int i = 0; i < 9; i++) L.items[i] = { L.box.x + 10 * s + (i % 3) * cell, L.box.y + 24 * s + (i / 3) * cell, cell - 4 * s, cell - 4 * s };
+		for (int i = 0; i < 5; i++) L.items[9 + i] = { L.box.x + 3 * cell + 20 * s, L.box.y + 24 * s + i * 26 * s, 200 * s, 22 * s };
+		L.items[14] = { L.box.x + 10 * s, L.box.y + h - 36 * s, w - 20 * s, 22 * s };
+		return L;
+	}
+	// What's under (x, y): an item, -1 elsewhere in the panel, -2 outside it.
+	int Hit(const SDL_FRect& r, float x, float y) const
+	{
+		Layout L = Lay(r);
+		SDL_FPoint p{ x, y };
+		for (int i = 0; i < kCount; i++) if (SDL_PointInRectFloat(&p, &L.items[i])) return i;
+		return SDL_PointInRectFloat(&p, &L.box) ? -1 : -2;
+	}
+	std::string Chosen() const { return sel < 9 ? std::string(":") + kEmojis[sel] + ":" : sel < 14 ? kPhrases[sel - 9] : typed; }
+	void Draw(const SDL_FRect& r) const
+	{
+		Layout L = Lay(r);
+		float s = L.s;
+		SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+		SDL_SetRenderDrawColor(g_ren, 10, 10, 18, 235);
+		SDL_RenderFillRect(g_ren, &L.box);
+		SDL_SetRenderDrawColor(g_ren, 255, 46, 136, 255);
+		SDL_RenderRect(g_ren, &L.box);
+		Text(L.box.x + 10 * s, L.box.y + 8 * s, s, "MENSAJE AL RIVAL   (Enter: mandar   Esc: cerrar)", 255, 46, 136);
+		for (int i = 0; i < kCount; i++) {
+			const SDL_FRect& it = L.items[i];
+			if (i == sel) { SDL_SetRenderDrawColor(g_ren, 255, 46, 136, 255); SDL_FRect hl{ it.x - 2 * s, it.y - 2 * s, it.w + 4 * s, it.h + 4 * s }; SDL_RenderFillRect(g_ren, &hl); }
+			SDL_SetRenderDrawColor(g_ren, 25, 25, 36, 255);
+			SDL_RenderFillRect(g_ren, &it);
+			if (i < 9) {
+				if (SDL_Texture* t = EmojiTexture(kEmojis[i])) SDL_RenderTexture(g_ren, t, NULL, &it);
+			} else {
+				std::string t = i < 14 ? kPhrases[i - 9] : (typed.empty() ? "Escribe aqui..." : Plain(typed) + "_");
+				Uint8 c = i == 14 && typed.empty() ? 140 : 235;
+				Text(it.x + 6 * s, it.y + 7 * s, s, t.c_str(), c, c, c);
+			}
+		}
+	}
+};
+
+static void SaveWindow(const std::string& path);
+
+// shots: "captura=<folder>" (checking the screen without hands): once playing, a
+// message arrives, then the panel opens, then the pause; a picture of each.
+static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string& shots = "")
 {
 	char msg[300] = "";
 	if (guasa_init(roms, msg, sizeof(msg))) {
@@ -511,10 +654,17 @@ static int PlayOnline(const char* roms, const NetConfig& cfg)
 
 	// The interface can close the window by writing "salir" (the set is over).
 	static std::atomic<bool> leave{ false };
+	static std::mutex inboxLock;
+	static std::vector<ShownMessage> inbox;   // messages from the stdin thread
 	std::thread([] {
 		std::string line;
 		while (std::getline(std::cin, line)) {
 			if (line.rfind("salir", 0) == 0) { leave = true; return; }
+			if (line.rfind("mensaje ", 0) == 0) {   // "mensaje <name>\t<text>"
+				size_t tab = line.find('\t', 8);
+				std::lock_guard<std::mutex> lock(inboxLock);
+				if (tab != std::string::npos) inbox.push_back({ line.substr(8, tab - 8), line.substr(tab + 1), 0 });
+			}
 			if (line.rfind("voz estado", 0) == 0) {
 				auto val = [&](const char* key) {
 					size_t at = line.find(key);
@@ -533,6 +683,33 @@ static int PlayOnline(const char* roms, const NetConfig& cfg)
 	Uint64 next = SDL_GetTicksNS(), endedAt = 0;
 	bool quit = false, showInputs = false, wasPlaying = false;
 	int shownDelay = -1;
+	MessagePanel panel;
+	NetMatch::Status st0 = NetMatch::Waiting;   // last frame's
+	std::deque<ShownMessage> shownMsgs;
+	std::string note;            // a short notice in the middle (the pause only in casual...)
+	Uint64 noteAt = 0;
+	bool pauseAsk = false;       // P (or START held): ask for the pause on the next frame
+	int startHeld = 0;
+	uint16_t lastPad = 0;
+	auto openPanel = [&](bool open) {
+		panel.open = open;
+		panel.typed.clear();
+		if (open) SDL_StartTextInput(g_win); else SDL_StopTextInput(g_win);
+	};
+	auto sendMessage = [&](const std::string& text) {
+		std::string clean;
+		for (char c : text) if (c != '\n' && c != '\r') clean += c;
+		if (clean.empty()) return;
+		clean = clean.substr(0, 120);
+		printf("mensaje %s\n", clean.c_str());
+		fflush(stdout);
+		shownMsgs.push_back({ "Tu", clean, SDL_GetTicksNS() });
+		openPanel(false);
+	};
+	auto askPause = [&]() {
+		if (!cfg.pause) { note = "La pausa solo existe en casual"; noteAt = SDL_GetTicksNS(); return; }
+		pauseAsk = true;
+	};
 	double pingSum = 0, jitterSum = 0;   // for the summary the hub keeps (average while playing)
 	int pingN = 0;
 	unsigned pingMax = 0;
@@ -544,9 +721,41 @@ static int PlayOnline(const char* roms, const NetConfig& cfg)
 			case SDL_EVENT_QUIT: quit = true; break;
 			case SDL_EVENT_JOYSTICK_ADDED: AddDevice(ev.jdevice.which); break;
 			case SDL_EVENT_JOYSTICK_REMOVED: RemoveDevice(ev.jdevice.which); break;
+				case SDL_EVENT_TEXT_INPUT:
+				if (panel.open && panel.typed.size() < 120) { panel.typed += ev.text.text; panel.sel = 14; }
+				break;
+			case SDL_EVENT_MOUSE_MOTION:
+			case SDL_EVENT_MOUSE_BUTTON_DOWN:
+				if (panel.open) {
+					SDL_ConvertEventToRenderCoordinates(g_ren, &ev);
+					bool moved = ev.type == SDL_EVENT_MOUSE_MOTION;
+					int hit = panel.Hit(GameRect(), moved ? ev.motion.x : ev.button.x, moved ? ev.motion.y : ev.button.y);
+					if (hit >= 0) panel.sel = hit;
+					if (!moved && hit == -2) openPanel(false);
+					else if (!moved && hit >= 0 && hit < 14) sendMessage(panel.Chosen());
+				}
+				break;
 			case SDL_EVENT_KEY_DOWN:
+				if (panel.open) {   // the panel takes the keyboard while it's open
+					switch (ev.key.scancode) {
+					case SDL_SCANCODE_ESCAPE: openPanel(false); break;
+					case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: sendMessage(panel.Chosen()); break;
+					case SDL_SCANCODE_BACKSPACE:
+						while (!panel.typed.empty() && ((unsigned char)panel.typed.back() & 0xC0) == 0x80) panel.typed.pop_back();
+						if (!panel.typed.empty()) panel.typed.pop_back();
+						break;
+					case SDL_SCANCODE_LEFT: if (panel.sel > 0 && panel.sel != 14) panel.sel--; break;
+					case SDL_SCANCODE_RIGHT: if (panel.sel < 13) panel.sel++; break;
+					case SDL_SCANCODE_UP: panel.sel = panel.sel == 14 ? 13 : panel.sel >= 9 ? (panel.sel > 9 ? panel.sel - 1 : 8) : (panel.sel >= 3 ? panel.sel - 3 : panel.sel); break;
+					case SDL_SCANCODE_DOWN: panel.sel = panel.sel < 6 ? panel.sel + 3 : panel.sel < 9 ? 14 : SDL_min(panel.sel + 1, 14); break;
+					default: break;
+					}
+					break;
+				}
 				switch (ev.key.scancode) {
 				case SDL_SCANCODE_ESCAPE: quit = true; break;
+				case SDL_SCANCODE_T: openPanel(true); break;
+				case SDL_SCANCODE_P: case SDL_SCANCODE_PAUSE: askPause(); break;
 				case SDL_SCANCODE_F1: StartCapture(); break;
 				case SDL_SCANCODE_F2: showInputs = !showInputs; break;
 				case SDL_SCANCODE_F5: net.SetDelay(net.Stats().delay - 1); break;
@@ -561,12 +770,46 @@ static int PlayOnline(const char* roms, const NetConfig& cfg)
 			}
 		}
 
+		{
+			std::lock_guard<std::mutex> lock(inboxLock);
+			for (auto& m : inbox) shownMsgs.push_back({ m.from, m.text, SDL_GetTicksNS() });
+			inbox.clear();
+		}
+		while (shownMsgs.size() > 3) shownMsgs.pop_front();
 		uint16_t in[2] = { 0, 0 };
 		if (!g_cap.active) ReadPlayers(in);   // this side plays with player 1's controls
+		uint16_t pad = in[0], pressed = pad & ~lastPad;
+		lastPad = pad;
+		if (panel.open) {   // with the controller: directions move, a punch sends, a kick closes
+			if (pressed & GUASA_LEFT) panel.sel = SDL_max(panel.sel - 1, 0);
+			if (pressed & GUASA_RIGHT) panel.sel = SDL_min(panel.sel + 1, 13);
+			if (pressed & GUASA_UP) panel.sel = panel.sel >= 3 && panel.sel < 9 ? panel.sel - 3 : panel.sel;
+			if (pressed & GUASA_DOWN) panel.sel = panel.sel < 6 ? panel.sel + 3 : panel.sel;
+			if (pressed & (GUASA_LP | GUASA_MP | GUASA_HP)) sendMessage(panel.Chosen());
+			else if (pressed & (GUASA_LK | GUASA_MK | GUASA_HK)) openPanel(false);
+			in[0] = 0;   // the fight doesn't get these buttons
+		}
+		// START held a second asks for the pause too (for those on a controller)
+		startHeld = (in[0] & GUASA_START) ? startHeld + 1 : 0;
+		if (startHeld == 60) askPause();
+		if (!shots.empty() && st0 == NetMatch::Playing) {   // the script
+			static int t = 0;
+			t++;
+			if (t == 60) { std::lock_guard<std::mutex> lock(inboxLock); inbox.push_back({ "Rival", ":palomo:", 0 }); inbox.push_back({ "Rival", "Que tal, mi hermano? Una mas!", 0 }); }
+			if (t == 90) SaveWindow(shots + "/online-mensajes.bmp");
+			if (t == 100) { openPanel(true); panel.sel = 4; }
+			if (t == 110) SaveWindow(shots + "/online-panel.bmp");
+			if (t == 120) { openPanel(false); askPause(); }
+			if (t == 170) SaveWindow(shots + "/online-pausa.bmp");
+			if (t == 180) quit = true;
+		}
+		uint16_t local = in[0];
+		if (pauseAsk) { local |= kPauseBit; pauseAsk = false; }   // one frame is enough: both games see it
 		bool shown = false;
-		NetMatch::Status st = net.Step(in[0], true, &shown);
+		NetMatch::Status st = net.Step(local, true, &shown);
+		st0 = st;
 		const NetStats& stats = net.Stats();
-		if (shown) {
+		if (shown && net.Pause().phase == 0) {   // paused: no sound (it would repeat)
 			PushAudio();
 			if (int w = results.Update()) { printf("resultado %d\n", w); fflush(stdout); }
 			if (st == NetMatch::Playing && stats.ping) {
@@ -579,13 +822,31 @@ static int PlayOnline(const char* roms, const NetConfig& cfg)
 		if (stats.delay != shownDelay) { printf("delay %d\n", stats.delay); fflush(stdout); shownDelay = stats.delay; }
 
 		std::string banner;
+		const PauseState& ps = net.Pause();
 		if (g_cap.active) banner = CaptureBanner();
 		else if (st == NetMatch::Waiting) banner = "CONECTANDO\n" + net.RouteText() + "   (Esc = salir)";
+		else if (ps.phase == 1) {
+			int left = (int)((5 * 60 * guasa_fps() - ps.frames) / guasa_fps());
+			char b[160];
+			snprintf(b, sizeof(b), "PAUSA\n%s. Quedan %d:%02d. P o START: seguir", ps.by == cfg.local ? "Pausaste" : "Tu rival pauso", left / 60, left % 60);
+			banner = b;
+		} else if (ps.phase == 2) banner = "VOLVEMOS EN " + std::to_string((int)(ps.frames / guasa_fps()) + 1) + "\n ";
 		else if (st == NetMatch::Ended) {
 			if (!endedAt) { endedAt = SDL_GetTicksNS(); printf("fin: %s\n", net.EndReason().c_str()); fflush(stdout); }
 			banner = "FIN DE LA PARTIDA\n" + net.EndReason() + "   (Esc = salir)";
 			if (SDL_GetTicksNS() - endedAt > 8000000000ULL) quit = true;
 		}
+		g_overlay = [&](const SDL_FRect& r) {
+			DrawMessages(r, shownMsgs);
+			if (panel.open) panel.Draw(r);
+			if (!note.empty() && SDL_GetTicksNS() - noteAt < 2500000000ULL) {
+				float s = r.h / 450 > 1 ? r.h / 450 : 1;
+				SDL_FRect b{ r.x + r.w / 2 - 150 * s, r.y + 40 * s, 300 * s, 22 * s };
+				SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 200);
+				SDL_RenderFillRect(g_ren, &b);
+				Text(b.x + 8 * s, b.y + 7 * s, s, note.c_str(), 255, 220, 120);
+			}
+		};
 		// the buttons the game used, so the other player's show too
 		Present(showInputs && st == NetMatch::Playing ? net.LastInputs() : NULL, banner.empty() ? NULL : banner.c_str(),
 		        st == NetMatch::Playing ? &stats : NULL, cfg.local);
@@ -601,6 +862,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg)
 	       s.frame, pingN ? pingSum / pingN : 0.0, pingMax, pingN ? jitterSum / pingN : 0.0, s.delay, s.rollbacks, s.maxRollback,
 	       s.desyncs, s.firstDesync, net.Relayed() ? "servidor" : "directa");
 	fflush(stdout);
+	g_overlay = nullptr;
 	net.Stop();
 	CloseAll();
 	return s.desyncs ? 1 : 0;
@@ -670,34 +932,35 @@ static void DrawFrameMeter(const SDL_FRect& r, const FrameMeter& m)
 		{ 35, 35, 45 },    // frozen (hitstop, only one of the two)
 	};
 	size_t n = m.row[0].size();
-	float label = 48 * s, cell = SDL_min(7 * s, (r.w - label - 20 * s) / FrameMeter::kMax), h = 10 * s;
+	// narrow and see-through, so it covers little of the fight: at most ~40% of the
+	// width (long exchanges get thinner frames), on a faint background
+	float ts = s * 0.85f, label = 30 * s, h = 7 * s;
+	float cell = SDL_min(4 * s, (r.w * 0.40f - label) / SDL_max((float)n, 1.0f));
 	float x0 = r.x + 8 * s + label, y0 = r.y + r.h - 14 * s - 2 * h - 44 * s;   // above the super meter
+	char nums[64] = "", adv[24] = "";
+	if (m.done && m.who >= 0 && m.active)
+		snprintf(nums, sizeof(nums), "Inicio %d  Activo %d  Recup. %d%s", m.startup, m.active, m.recovery, m.who ? " (rival)" : "");
+	if (m.done && m.hasAdvantage) snprintf(adv, sizeof(adv), "%+d  ", m.advantage);
+	float textW = (strlen(adv) + strlen(nums)) * 8 * ts;
 	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
-	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 170);
-	SDL_FRect bg{ r.x + 4 * s, y0 - 14 * s, label + cell * n + 12 * s, 2 * h + 22 * s };
-	bg.w = SDL_max(bg.w, 330 * s);
+	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 90);
+	SDL_FRect bg{ r.x + 4 * s, y0 - 12 * s, SDL_max(label + cell * n + 10 * s, textW + 10 * s), 2 * h + 18 * s };
 	SDL_RenderFillRect(g_ren, &bg);
 	for (int p = 0; p < 2; p++) {
-		float y = y0 + p * (h + 3 * s);
-		Text(r.x + 8 * s, y + 1 * s, s, p ? "RIVAL" : "TU", 220, 220, 220);
+		float y = y0 + p * (h + 2 * s);
+		Text(r.x + 8 * s, y, ts, p ? "RIV" : "TU", 220, 220, 220);
 		for (size_t i = 0; i < n; i++) {
 			const Uint8* c = colors[m.row[p][i] < 10 ? m.row[p][i] : 0];
-			SDL_SetRenderDrawColor(g_ren, c[0], c[1], c[2], 255);
-			SDL_FRect f{ x0 + i * cell, y, SDL_max(cell - 1, 1.0f), h };
+			SDL_SetRenderDrawColor(g_ren, c[0], c[1], c[2], 190);
+			SDL_FRect f{ x0 + i * cell, y, SDL_max(cell - (cell > 2 * s ? 1 : 0), 1.0f), h };
 			SDL_RenderFillRect(g_ren, &f);
 		}
 	}
-	if (!m.done) return;
-	char t[96] = "";
-	if (m.who >= 0 && m.active)
-		snprintf(t, sizeof(t), "%s  Arranque %d  Activo %d  Recuperacion %d", m.who ? "Rival:" : "Tu golpe:", m.startup, m.active, m.recovery);
-	Text(r.x + 8 * s, y0 - 11 * s, s, t, 230, 230, 230);
-	if (m.hasAdvantage) {
-		char a[32];
-		snprintf(a, sizeof(a), "Ventaja %+d", m.advantage);
+	if (adv[0]) {   // the advantage first and in color: green ahead, red behind
 		Uint8 g = m.advantage > 0 ? 255 : m.advantage < 0 ? 90 : 230, rr = m.advantage < 0 ? 255 : m.advantage > 0 ? 120 : 230;
-		Text(bg.x + bg.w - (8 + 8 * strlen(a)) * s, y0 - 11 * s, s, a, rr, g, m.advantage > 0 ? 140 : 90);
+		Text(r.x + 8 * s, y0 - 10 * s, ts, adv, rr, g, m.advantage > 0 ? 140 : 90);
 	}
+	Text(r.x + 8 * s + strlen(adv) * 8 * ts, y0 - 10 * s, ts, nums, 225, 225, 225);
 }
 
 struct MenuItem {
@@ -1173,13 +1436,15 @@ int main(int argc, char** argv)
 			cfg.local = atoi(argv[3]) - 1;
 			cfg.port = atoi(argv[4]);
 		}
+		std::string shots;
 		for (int i = 5; i < argc; i++)
-			if (!ParseNetArg(argv[i], cfg)) { fprintf(stderr, "opción desconocida: %s\n", argv[i]); return 2; }
+			if (!strncmp(argv[i], "captura=", 8)) shots = argv[i] + 8;
+			else if (!ParseNetArg(argv[i], cfg)) { fprintf(stderr, "opción desconocida: %s\n", argv[i]); return 2; }
 		if (argc < 6 || cfg.local < 0 || cfg.local > 1 || (cfg.remote.empty() && (cfg.relay.empty() || cfg.token.size() != 16))) {
 			fprintf(stderr, "uso: guasa-game online <carpeta de ROMs> <1|2> <puerto_local> (<ip:puerto> | relay=<host:puerto> token=<32 hex> [relayonly]) [delay=N|auto] [lag=MS] [jitter=MS] [loss=PCT]\n");
 			return 2;
 		}
-		return PlayOnline(argv[2], cfg);
+		return PlayOnline(argv[2], cfg, shots);
 	}
 	fprintf(stderr, "modo desconocido: %s\n", mode.c_str());
 	return 2;

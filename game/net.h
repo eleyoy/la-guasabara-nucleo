@@ -13,6 +13,7 @@ struct NetConfig {
 	std::string relay;           // "host:port" of the hub's relay (online sets)
 	std::vector<uint8_t> token;  // this player's code for the set
 	bool relayOnly = false;
+	bool pause = false;          // casual sets: either player can pause (kPauseBit, below)
 	int delay = -1;              // frames of input delay; -1 = automatic from the ping
 	int lagMs = 0, jitterMs = 0, lossPct = 0;   // bad-internet simulator, for tests
 };
@@ -27,6 +28,17 @@ struct NetStats {
 	int rollbacks = 0, lastRollback = 0, maxRollback = 0, resimulated = 0;
 	int desyncs = 0;
 	int firstDesync = -1;
+};
+
+// The pause of casual sets. Asking for it is one more bit of the buttons, so it
+// reaches both games on the same frame; its state is part of the game's state
+// (saved with it), so rollbacks redo it too and the two games never differ.
+// Up to 5 minutes; then, or when either player asks, a countdown and the game goes on.
+constexpr uint16_t kPauseBit = 0x8000;
+struct PauseState {
+	int32_t phase = 0;           // 0 playing, 1 paused, 2 counting down to go on
+	int32_t by = -1;             // who paused: 0 player 1, 1 player 2
+	int32_t frames = 0;          // paused: frames so far; counting down: frames left
 };
 
 class NetMatch {
@@ -57,6 +69,7 @@ public:
 	const std::string& EndReason() const { return m_endReason; }
 	// The buttons the game used on the last shown frame, both players.
 	const uint16_t* LastInputs() const { return m_lastInputs; }
+	const PauseState& Pause() const { return m_pause; }
 
 private:
 	struct GekkoSession* m_session = nullptr;
@@ -69,6 +82,8 @@ private:
 	int m_startedAtFrame = 0;
 	std::string m_endReason;
 	uint16_t m_lastInputs[2] = { 0, 0 };
+	PauseState m_pause;
+	bool PauseFrame(const uint16_t in[2]);
 };
 
 // The online options of the window and the bot, one per argument:

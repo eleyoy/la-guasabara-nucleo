@@ -37,7 +37,7 @@ static uint16_t BotInput(int frame, uint64_t& rng)
 int main(int argc, char** argv)
 {
 	NetConfig cfg;
-	int frames = 0;
+	int frames = 0, pauseAt = -1, resumeAt = -1;   // pausaen=N seguiren=N: ask for the pause / to go on, at those frames (tests)
 	uint64_t rng = 0;
 	if (argc >= 4) {
 		cfg.local = atoi(argv[2]) - 1;
@@ -47,10 +47,12 @@ int main(int argc, char** argv)
 	for (int i = 4; i < argc; i++) {
 		if (!strncmp(argv[i], "frames=", 7)) frames = atoi(argv[i] + 7);
 		else if (!strncmp(argv[i], "seed=", 5)) rng = strtoull(argv[i] + 5, NULL, 10);
+		else if (!strncmp(argv[i], "pausaen=", 8)) pauseAt = atoi(argv[i] + 8);
+		else if (!strncmp(argv[i], "seguiren=", 9)) resumeAt = atoi(argv[i] + 9);
 		else if (!ParseNetArg(argv[i], cfg)) { fprintf(stderr, "opcion desconocida: %s\n", argv[i]); return 2; }
 	}
 	if (argc < 5 || cfg.local < 0 || cfg.local > 1 || (cfg.remote.empty() && (cfg.relay.empty() || cfg.token.size() != 16))) {
-		fprintf(stderr, "uso: guasa-bot <roms> <1|2> <puerto_local> (<ip:puerto> | relay=<host:puerto> token=<32 hex> [relayonly]) [frames=N] [delay=N|auto] [seed=N] [lag=MS] [jitter=MS] [loss=PCT]\n");
+		fprintf(stderr, "uso: guasa-bot <roms> <1|2> <puerto_local> (<ip:puerto> | relay=<host:puerto> token=<32 hex> [relayonly]) [frames=N] [delay=N|auto] [seed=N] [lag=MS] [jitter=MS] [loss=PCT] [pausa] [pausaen=N] [seguiren=N]\n");
 		return 2;
 	}
 
@@ -72,7 +74,7 @@ int main(int argc, char** argv)
 
 	const auto frameTime = std::chrono::nanoseconds((long long)(1e9 / guasa_fps()));
 	auto next = std::chrono::steady_clock::now(), tStart = next;
-	int localFrame = 0, shownDelay = -1;
+	int localFrame = 0, shownDelay = -1, pausePhase = 0;
 	bool wasPlaying = false;
 	ResultWatcher results;
 	double pingSum = 0;
@@ -80,8 +82,16 @@ int main(int argc, char** argv)
 	unsigned pingMax = 0;
 	for (;;) {
 		bool shown = false;
-		NetMatch::Status st = net.Step(BotInput(localFrame++, rng), false, &shown);
+		uint16_t in = BotInput(localFrame, rng);
+		if (localFrame == pauseAt || localFrame == resumeAt) in |= kPauseBit;
+		localFrame++;
+		NetMatch::Status st = net.Step(in, false, &shown);
 		const NetStats& s = net.Stats();
+		if (net.Pause().phase != pausePhase) {
+			pausePhase = net.Pause().phase;
+			printf("pausa fase %d (la pidio P%d) en el cuadro %d\n", pausePhase, net.Pause().by + 1, s.frame);
+			fflush(stdout);
+		}
 		if (st == NetMatch::Playing && !wasPlaying) {
 			printf("empezo la partida\n");
 			fflush(stdout);
