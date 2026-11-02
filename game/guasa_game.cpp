@@ -18,8 +18,10 @@
 // Online, for the interface: "resultado 1|2" on stdout when a game ends, "voz mic"
 // and "voz rival" for F7 and F8, "mensaje <text>" for a message to the rival (T);
 // on stdin "salir" closes the window (the set is over), "voz estado mic=on|off
-// rival=on|off|nada" updates the voice indicator and "mensaje <name>\t<text>"
-// shows a message (":id:" is one of the league's emojis).
+// rival=on|off|nada" updates the voice indicator, "mensaje <name>\t<text>"
+// shows a message (":id:" is one of the league's emojis), "rapido <0-9> <text>"
+// sets what keys 1 to 0 send (0 = key 1 ... 9 = key 0) and "jugador <0|1>
+// <rank|-> <name>" names each side, with its rank's badge.
 // Every match starts from the starting state generated here (guasa_boot_to_select),
 // and the window keeps the game's own pace, 59.63 frames per second.
 
@@ -558,6 +560,77 @@ static std::string EmojiOf(const std::string& text)
 	return "";
 }
 
+// A name's color, the same one the app gives it in the chats: soft colors, a few
+// of them, so some names share one (as in Fightcade). From the UTF-8 bytes.
+static void NameColor(const std::string& name, Uint8& r, Uint8& g, Uint8& b)
+{
+	static const Uint8 palette[][3] = { { 0xE9, 0xA6, 0xA6 }, { 0xE8, 0xC0, 0x7D }, { 0xA8, 0xD0, 0x8D }, { 0x7F, 0xC8, 0xC2 },
+		{ 0x8F, 0xB3, 0xE8 }, { 0xB7, 0xA3, 0xE3 }, { 0xE3, 0xA3, 0xCF }, { 0xC9, 0xB7, 0x9C }, { 0x9C, 0xC9, 0xE3 }, { 0xD4, 0xD4, 0x8A } };
+	uint32_t h = 0;
+	for (unsigned char c : name) h = h * 31 + c;
+	const Uint8* p = palette[h % 10];
+	r = p[0]; g = p[1]; b = p[2];
+}
+
+// Each side's player, as the app says: name and rank (empty: no rank yet).
+static std::mutex g_namesLock;
+static std::string g_names[2], g_ranks[2];
+
+// A rank's badge, from the "rangos" folder next to the game (loaded once).
+static SDL_Texture* RankTexture(const std::string& rank)
+{
+	static std::map<std::string, SDL_Texture*> cache;
+	auto it = cache.find(rank);
+	if (it != cache.end()) return it->second;
+	std::string file;
+	for (char c : rank) file += (char)SDL_tolower((unsigned char)c);
+	SDL_Texture* t = NULL;
+	if (SDL_Surface* sf = SDL_LoadPNG((std::string(SDL_GetBasePath()) + "rangos/" + file + ".png").c_str())) {
+		t = SDL_CreateTextureFromSurface(g_ren, sf);
+		SDL_DestroySurface(sf);
+	}
+	cache[rank] = t;
+	return t;
+}
+
+// Under the top line: player 1's name and badge on the left, player 2's on the right.
+static void DrawNames(const SDL_FRect& r)
+{
+	std::string names[2], ranks[2];
+	{
+		std::lock_guard<std::mutex> lock(g_namesLock);
+		for (int p = 0; p < 2; p++) { names[p] = g_names[p]; ranks[p] = g_ranks[p]; }
+	}
+	float s = r.h / 450 > 1 ? r.h / 450 : 1, h = 22 * s, y = r.y + 15 * s, ts = s * 1.25f;
+	for (int p = 0; p < 2; p++) {
+		if (names[p].empty()) continue;
+		std::string n = Plain(names[p]);
+		float w = h + 6 * s + n.size() * 8 * ts + 12 * s;
+		SDL_FRect box{ p ? r.x + r.w - w - 4 * s : r.x + 4 * s, y, w, h };
+		SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+		SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 140);
+		SDL_RenderFillRect(g_ren, &box);
+		SDL_FRect badge{ box.x + 3 * s, box.y + 1 * s, h - 2 * s, h - 2 * s };
+		if (SDL_Texture* t = ranks[p].empty() ? NULL : RankTexture(ranks[p])) SDL_RenderTexture(g_ren, t, NULL, &badge);
+		else Text(badge.x + 3 * s, badge.y + 3 * s, s, "?", 170, 170, 170);
+		Uint8 cr, cg, cb;
+		NameColor(names[p], cr, cg, cb);
+		Text(box.x + h + 6 * s, box.y + 6 * s, ts, n.c_str(), cr, cg, cb);
+	}
+}
+
+// Keys 1 to 0: quick messages, as the app says (chosen in Mi perfil).
+static std::mutex g_quickLock;
+static std::string g_quick[10];
+
+// The quick slot of a key: top-row 1..0 (unless it's a game button) or the keypad's; -1 none.
+static int QuickSlot(SDL_Scancode sc)
+{
+	if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_0) return KeyIsButton(sc) ? -1 : sc - SDL_SCANCODE_1;
+	if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_0) return sc - SDL_SCANCODE_KP_1;
+	return -1;
+}
+
 struct ShownMessage { std::string from, text; Uint64 at; int side; };   // side: 0 player 1, 1 player 2
 
 // The last messages, each for 6 seconds, on the side of who wrote it: player 1's
@@ -566,7 +639,7 @@ static void DrawMessages(const SDL_FRect& r, std::deque<ShownMessage>& list)
 {
 	Uint64 now = SDL_GetTicksNS();
 	while (!list.empty() && now - list.front().at > 6000000000ULL) list.pop_front();
-	float s = r.h / 450 > 1 ? r.h / 450 : 1, ys[2] = { r.y + 20 * s, r.y + 20 * s };
+	float s = r.h / 450 > 1 ? r.h / 450 : 1, ys[2] = { r.y + 42 * s, r.y + 42 * s };
 	for (auto& m : list) {
 		float& y = ys[m.side ? 1 : 0];
 		std::string id = EmojiOf(m.text), text = id.empty() ? Plain(m.text) : "";
@@ -579,7 +652,9 @@ static void DrawMessages(const SDL_FRect& r, std::deque<ShownMessage>& list)
 		SDL_SetRenderDrawColor(g_ren, 255, 46, 136, 255);
 		SDL_FRect bar{ box.x, box.y, 3 * s, h };
 		SDL_RenderFillRect(g_ren, &bar);
-		Text(box.x + 8 * s, box.y + 5 * s, s, Plain(m.from).c_str(), 255, 150, 200);
+		Uint8 nr, ng, nb;
+		NameColor(m.from, nr, ng, nb);
+		Text(box.x + 8 * s, box.y + 5 * s, s, Plain(m.from).c_str(), nr, ng, nb);
 		if (!id.empty()) {
 			if (SDL_Texture* t = EmojiTexture(id)) { SDL_FRect d{ box.x + w - big - 4 * s, box.y + 4 * s, big, big }; SDL_RenderTexture(g_ren, t, NULL, &d); }
 		} else Text(box.x + 8 * s, box.y + 16 * s, s, text.c_str(), 240, 240, 240);
@@ -598,11 +673,11 @@ struct MessagePanel {
 	{
 		Layout L;
 		L.s = r.h / 450 > 1 ? r.h / 450 : 1;
-		float s = L.s, cell = 52 * s, w = 3 * cell + 230 * s, h = 3 * cell + 70 * s;
+		float s = L.s, cell = 52 * s, w = 3 * cell + 230 * s, h = 3 * cell + 86 * s;
 		L.box = { r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, w, h };
 		for (int i = 0; i < 9; i++) L.items[i] = { L.box.x + 10 * s + (i % 3) * cell, L.box.y + 24 * s + (i / 3) * cell, cell - 4 * s, cell - 4 * s };
 		for (int i = 0; i < 5; i++) L.items[9 + i] = { L.box.x + 3 * cell + 20 * s, L.box.y + 24 * s + i * 26 * s, 200 * s, 22 * s };
-		L.items[14] = { L.box.x + 10 * s, L.box.y + h - 36 * s, w - 20 * s, 22 * s };
+		L.items[14] = { L.box.x + 10 * s, L.box.y + h - 52 * s, w - 20 * s, 22 * s };
 		return L;
 	}
 	// What's under (x, y): an item, -1 elsewhere in the panel, -2 outside it.
@@ -637,6 +712,7 @@ struct MessagePanel {
 				Text(it.x + 6 * s, it.y + 7 * s, s, t.c_str(), c, c, c);
 			}
 		}
+		Text(L.box.x + 10 * s, L.box.y + L.box.h - 18 * s, s, "Sin abrir esto: teclas 1 a 0 = mensajes rapidos (Mi perfil)", 170, 170, 170);
 	}
 };
 
@@ -676,6 +752,19 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 		std::string line;
 		while (std::getline(std::cin, line)) {
 			if (line.rfind("salir", 0) == 0) { leave = true; return; }
+			if (line.rfind("jugador ", 0) == 0 && line.size() > 10 && (line[8] == '0' || line[8] == '1')) {   // "jugador <0|1> <rank|-> <name>"
+				size_t sp = line.find(' ', 10);
+				if (sp != std::string::npos) {
+					std::lock_guard<std::mutex> lock(g_namesLock);
+					std::string rank = line.substr(10, sp - 10);
+					g_ranks[line[8] - '0'] = rank == "-" ? "" : rank;
+					g_names[line[8] - '0'] = line.substr(sp + 1);
+				}
+			}
+			if (line.rfind("rapido ", 0) == 0 && line.size() > 8 && line[7] >= '0' && line[7] <= '9') {   // "rapido <n> <text>"
+				std::lock_guard<std::mutex> lock(g_quickLock);
+				g_quick[line[7] - '0'] = line.size() > 9 ? line.substr(9) : "";
+			}
 			if (line.rfind("mensaje ", 0) == 0) {   // "mensaje <name>\t<text>"
 				size_t tab = line.find('\t', 8);
 				std::lock_guard<std::mutex> lock(inboxLock);
@@ -776,6 +865,17 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 				case SDL_SCANCODE_F4: openPanel(true); break;
 				case SDL_SCANCODE_P: if (!KeyIsButton(SDL_SCANCODE_P)) askPause(); break;
 				case SDL_SCANCODE_F3: case SDL_SCANCODE_PAUSE: askPause(); break;
+				case SDL_SCANCODE_1: case SDL_SCANCODE_2: case SDL_SCANCODE_3: case SDL_SCANCODE_4: case SDL_SCANCODE_5:
+				case SDL_SCANCODE_6: case SDL_SCANCODE_7: case SDL_SCANCODE_8: case SDL_SCANCODE_9: case SDL_SCANCODE_0:
+				case SDL_SCANCODE_KP_1: case SDL_SCANCODE_KP_2: case SDL_SCANCODE_KP_3: case SDL_SCANCODE_KP_4: case SDL_SCANCODE_KP_5:
+				case SDL_SCANCODE_KP_6: case SDL_SCANCODE_KP_7: case SDL_SCANCODE_KP_8: case SDL_SCANCODE_KP_9: case SDL_SCANCODE_KP_0:
+					if (!ev.key.repeat) {   // a quick message: sent at once
+						int slot = QuickSlot(ev.key.scancode);
+						std::string text;
+						if (slot >= 0) { std::lock_guard<std::mutex> lock(g_quickLock); text = g_quick[slot]; }
+						if (!text.empty()) sendMessage(text);
+					}
+					break;
 				case SDL_SCANCODE_F1: StartCapture(); break;
 				case SDL_SCANCODE_F2: showInputs = !showInputs; break;
 				case SDL_SCANCODE_F5: net.SetDelay(net.Stats().delay - 1); break;
@@ -818,7 +918,13 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 		if (!shots.empty() && st0 == NetMatch::Playing) {   // the script
 			static int t = 0;
 			t++;
-			if (t == 60) { std::lock_guard<std::mutex> lock(inboxLock); inbox.push_back({ "Rival", ":palomo:", 0, 0 }); inbox.push_back({ "Rival", "Que tal, mi hermano? Una mas!", 0, 0 }); shownMsgs.push_back({ "Tu", ":ggs:", SDL_GetTicksNS(), cfg.local }); }
+			if (t == 60) {
+				{ std::lock_guard<std::mutex> lock(g_namesLock); g_names[0] = "yoy"; g_ranks[0] = "Naboria"; g_names[1] = "ELGINGIRIANO"; g_ranks[1] = ""; }
+				std::lock_guard<std::mutex> lock(inboxLock);
+				inbox.push_back({ "ELGINGIRIANO", ":palomo:", 0, 0 });
+				inbox.push_back({ "ELGINGIRIANO", "Que tal, mi hermano? Una mas!", 0, 0 });
+				shownMsgs.push_back({ "yoy", ":ggs:", SDL_GetTicksNS(), cfg.local });
+			}
 			if (t == 90) SaveWindow(shots + "/online-mensajes.bmp");
 			if (t == 100) { openPanel(true); panel.sel = 4; }
 			if (t == 110) SaveWindow(shots + "/online-panel.bmp");
@@ -860,6 +966,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 			if (SDL_GetTicksNS() - endedAt > 8000000000ULL) quit = true;
 		}
 		g_overlay = [&](const SDL_FRect& r) {
+			if (st == NetMatch::Playing || st == NetMatch::Ended) DrawNames(r);
 			DrawMessages(r, shownMsgs);
 			if (panel.open) panel.Draw(r);
 			if (!note.empty() && SDL_GetTicksNS() - noteAt < 2500000000ULL) {
