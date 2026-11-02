@@ -39,6 +39,7 @@ void CallRegisteredLuaMemHook(unsigned int, int, unsigned int, LuaMemHookType) {
 
 void QscScanResampler(INT32 nAction);   // spike/patches/0001
 extern UINT8* CpsRamFF;                 // 68000 work RAM, 0xFF0000-0xFFFFFF
+extern UINT8* CpsRom; extern UINT32 nCpsRomLen;   // 68000 program ROM as data reads see it
 
 // ---------------------------------------------------------------------------
 // XXH64 (seed 0), from the public xxHash specification.
@@ -524,6 +525,14 @@ uint64_t guasa_game_hash(void) { return guasa_xxh64(CpsRamFF, 0x10000); }
 uint8_t guasa_read_ram(uint32_t address)
 {
 	return CpsRamFF[(address & 0xFFFF) ^ 1];   // stored as little-endian 16-bit words
+}
+
+uint8_t guasa_read_mem(uint32_t address)
+{
+	address &= 0xFFFFFF;
+	if (address >= 0xFF0000) return guasa_read_ram(address);
+	if (CpsRom && address < nCpsRomLen) return CpsRom[address ^ 1];   // same word layout as the RAM
+	return 0;
 }
 
 void guasa_write_ram(uint32_t address, uint8_t value)

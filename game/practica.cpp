@@ -32,6 +32,103 @@ static uint16_t Mirror(uint16_t in)
 	return in;
 }
 
+static uint32_t ReadLong(uint32_t a)
+{
+	return (uint32_t)ReadWord(a) << 16 | ReadWord(a + 2);
+}
+
+// One player's frame, by the rule worked out with core_test frames (±1 frame:
+// the game sometimes runs two ticks in one frame).
+FrameKind FrameMeter::Classify(int p)
+{
+	const uint32_t me = p ? kP2 : kP1, other = p ? kP1 : kP2;
+	uint8_t st = guasa_read_ram(me + 3), sub = guasa_read_ram(me + 4);
+	if (m_stop[p]) return kFrozen;   // hitstop: the frame after a nonzero counter doesn't move
+	if (guasa_read_ram(me + 0x63) || st == 0x14) return kThrow;
+	if (st == 0x0A || st == 0x0C || (st == 0x04 && sub == 0x06)) {   // attack, special, jump attack
+		if (st == 0x0A && guasa_read_ram(other + 0x63)) return kThrow;   // the thrower
+		if (st != 0x04 && sub == 0) return kStartup;   // its first tick: the animation isn't set yet
+		uint32_t anim = ReadLong(me + 0x1A);
+		if (guasa_read_mem(anim + 0x0C)) return kActive;
+		if (guasa_read_mem(anim + 0x16) == 1) return kRecovery;
+		if (st == 0x0C)   // a fireball out: the player is recovering
+			for (uint32_t o = 0xFF9C22; o < 0xFF9C22 + 8 * 0xC0; o += 0xC0)
+				if (guasa_read_ram(o) == 1 && ReadWord(o + 0x26) == (me & 0xFFFF)) return kRecovery;
+		return kStartup;
+	}
+	if (st == 0x0E) {
+		uint8_t how = guasa_read_ram(me + 0x4B);
+		return how == 0x06 || how == 0x08 ? kBlockstun : sub == 0x02 ? kHitstun : kDown;
+	}
+	if (st == 0x08 && m_state[p] == 0x0E) return kBlockstun;   // one more frame after blocking
+	if (st == 0x04) return sub == 0x04 && m_state[p] == 0x04 && m_sub[p] == 0x04 ? kFree : kAir;   // landing: free from its 2nd frame
+	return kFree;
+}
+
+void FrameMeter::Update()
+{
+	FrameKind k[2] = { Classify(0), Classify(1) };
+	for (int p = 0; p < 2; p++) {
+		uint32_t me = p ? kP2 : kP1;
+		m_state[p] = guasa_read_ram(me + 3);
+		m_sub[p] = guasa_read_ram(me + 4);
+		m_stop[p] = guasa_read_ram(me + 0x47);
+	}
+	if (k[0] == kFrozen && k[1] == kFrozen) return;   // hitstop isn't counted, as in SFV
+	auto busy = [](FrameKind f) { return f != kFree && f != kAir; };
+	if (done) {   // a new exchange starts when someone attacks or is hit
+		if (!busy(k[0]) && !busy(k[1])) return;
+		row[0].clear(); row[1].clear();
+		done = false;
+	}
+	row[0].push_back(k[0]);
+	row[1].push_back(k[1]);
+	if ((k[0] == kFree && k[1] == kFree) || (int)row[0].size() >= kMax) Finish();
+}
+
+void FrameMeter::Finish()
+{
+	done = true;
+	int freeAt[2];
+	bool took[2];
+	for (int p = 0; p < 2; p++) {
+		int i = (int)row[p].size() - 1;
+		while (i >= 0 && row[p][i] == kFree) i--;
+		freeAt[p] = i + 1;
+		took[p] = false;
+		for (uint8_t f : row[p]) took[p] |= f != kFree && f != kAir;
+	}
+	bool over = row[0].back() == kFree && row[1].back() == kFree;
+	hasAdvantage = over && took[0] && took[1];
+	advantage = freeAt[1] - freeAt[0];
+	// the first attack: its startup (frame of the first active one), active and recovery
+	who = -1;
+	for (size_t i = 0; i < row[0].size() && who < 0; i++)
+		for (int p = 0; p < 2 && who < 0; p++)
+			if (row[p][i] == kStartup || row[p][i] == kActive) who = p;
+	startup = active = recovery = 0;
+	if (who < 0) return;
+	bool hit = false;
+	for (uint8_t f : row[who]) {
+		if (f == kActive) { active++; hit = true; }
+		else if (f == kStartup && !hit) startup++;
+		else if (f == kRecovery) recovery++;
+	}
+	if (active) startup++;   // counted as the frame the attack can first hit
+}
+
+void FrameMeter::Reset()
+{
+	done = true;
+	row[0].clear(); row[1].clear();
+	for (int p = 0; p < 2; p++) {
+		uint32_t me = p ? kP2 : kP1;
+		m_state[p] = guasa_read_ram(me + 3);
+		m_sub[p] = guasa_read_ram(me + 4);
+		m_stop[p] = 0;
+	}
+}
+
 void Practice::Start()
 {
 	m_select.resize(guasa_state_size());
@@ -107,6 +204,7 @@ void Practice::AfterFrame(const uint16_t used[2])
 		if (m_spot.empty()) SavePosition();   // "volver a la posición" works from the first second
 	}
 	if (phase == Fight) {
+		meter.Update();
 		if (freezeClock) guasa_write_ram(kClock, 0x99);
 		if (fullSuper) { guasa_write_ram(kP1 + kSuper, kFullSuper); guasa_write_ram(kP2 + kSuper, kFullSuper); }
 		for (int p = 0; p < 2; p++) {
@@ -167,6 +265,7 @@ bool Practice::LoadPosition()
 	m_late.clear();
 	m_blockFor = 0;
 	tapePos = 0;   // the recording starts over with the position
+	meter.Reset();
 	return true;
 }
 
@@ -183,6 +282,7 @@ void Practice::ChangeCharacters()
 	m_late.clear();
 	m_lastClock = 0;
 	for (auto& h : history) h.clear();
+	meter.Reset();
 }
 
 std::string Practice::Status() const

@@ -7,6 +7,7 @@
 //   core_test <roms> rollback <frames>  save, load and 7-frame rollback on every frame
 //   core_test <roms> state <out.raw>    the starting state, for comparisons
 //   core_test <roms> cert <inputs.txt> <out.bin> [state=<raw>] [bmp=<path>]   RAM after every frame (core/cert/)
+//   core_test <roms> frames <script.txt> <out.bin>   scripted fight scenarios, RAM after every frame (frame meter research)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,6 +167,92 @@ int main(int argc, char** argv)
 		in[0] = in[1] = 0;
 		guasa_run_frame(in, 1);
 		SaveBmp(argc > 3 ? argv[3] : "explore.bmp");
+		guasa_exit();
+		return 0;
+	}
+
+	if (mode == "frames") {
+		// Frame meter research: picks Ryu (P1) and Ken (P2), waits until the clock
+		// first ticks (99 -> 98), then runs the scenarios in argv[3]. Each scenario
+		// starts from that same moment. Script lines:
+		//   = name            a new scenario (back to the start of the fight)
+		//   N p1 p2           N frames with these inputs (hex GUASA_* bits)
+		//   bmp <path>        one frame with no input, drawn and saved
+		//   mem <addr> <len>  prints len bytes there (hex; ROM or RAM, guasa_read_mem)
+		// argv[4] gets, for every frame, a 16-byte header (scenario, frame, p1, p2
+		// as little-endian u32), all 64 KB of work RAM after the frame, and 32
+		// bytes of ROM at each player's animation pointer (P1 then P2).
+		// Optional p1=<moves> p2=<moves>: cursor moves (L R U D) before picking,
+		// to try other characters.
+		if (argc < 5) { fprintf(stderr, "usage: core_test <roms> frames <script.txt> <out.bin> [p1=LRUD..] [p2=LRUD..]\n"); return 2; }
+		std::string moves[2];
+		for (int i = 5; i < argc; i++)
+			if (argv[i][0] == 'p' && (argv[i][1] == '1' || argv[i][1] == '2') && argv[i][2] == '=') moves[argv[i][1] - '1'] = argv[i] + 3;
+		guasa_boot_to_select();
+		uint16_t in[2] = { 0, 0 };
+		auto run = [&](int frames, uint16_t p1, uint16_t p2) { for (int f = 0; f < frames; f++) { in[0] = p1; in[1] = p2; guasa_run_frame(in, 0); } };
+		auto dir = [](const std::string& m, size_t k) -> uint16_t {
+			if (k >= m.size()) return 0;
+			char c = m[k];
+			return c == 'L' ? GUASA_LEFT : c == 'R' ? GUASA_RIGHT : c == 'U' ? GUASA_UP : c == 'D' ? GUASA_DOWN : 0;
+		};
+		run(30, 0, 0);
+		for (size_t k = 0; k < moves[0].size() || k < moves[1].size(); k++) { run(4, dir(moves[0], k), dir(moves[1], k)); run(8, 0, 0); }
+		run(4, GUASA_LP, GUASA_LP); run(30, 0, 0); run(4, GUASA_LP, GUASA_LP);
+		int f = 0;
+		for (; f < 4000 && guasa_read_ram(0xFF8DCE) != 0x99; f++) run(1, 0, 0);
+		for (; f < 8000 && guasa_read_ram(0xFF8DCE) != 0x98; f++) run(1, 0, 0);
+		printf("clock %02x after %d frames; chars %02x %02x\n", guasa_read_ram(0xFF8DCE), f,
+		       guasa_read_ram(0xFF844E + 0x391), guasa_read_ram(0xFF884E + 0x391));
+		const size_t size = guasa_state_size();
+		std::vector<uint8_t> start(size);
+		guasa_save(start.data(), size);
+		FILE* sc = fopen(argv[3], "r");
+		FILE* out = fopen(argv[4], "wb");
+		if (!sc || !out) { fprintf(stderr, "can't open the script or the output\n"); return 1; }
+		std::vector<uint8_t> ram(0x10000);
+		uint32_t scen = 0, frame = 0;
+		auto record = [&]() {
+			uint32_t hdr[4] = { scen, frame, in[0], in[1] };
+			fwrite(hdr, 4, 4, out);
+			for (uint32_t i = 0; i < 0x10000; i++) ram[i] = guasa_read_ram(0xFF0000 + i);
+			fwrite(ram.data(), 1, ram.size(), out);
+			// and 32 bytes of ROM at each player's animation pointer (long at +0x1A)
+			for (uint32_t pl = 0; pl < 2; pl++) {
+				uint32_t blk = 0xFF844E + 0x400 * pl, ptr = 0;
+				for (int k = 0; k < 4; k++) ptr = ptr << 8 | guasa_read_ram(blk + 0x1A + k);
+				uint8_t rom[32];
+				for (int k = 0; k < 32; k++) rom[k] = guasa_read_mem(ptr + k);
+				fwrite(rom, 1, 32, out);
+			}
+			frame++;
+		};
+		char line[512];
+		while (fgets(line, sizeof(line), sc)) {
+			unsigned n, a, b;
+			char path[400];
+			if (line[0] == '=') {
+				guasa_load(start.data(), size);
+				scen++; frame = 0;
+				printf("scenario %u:%s", scen, line + 1);
+			} else if (sscanf(line, "mem %x %x", &a, &b) == 2) {
+				// prints b bytes at address a (ROM or RAM)
+				for (unsigned k = 0; k < b; k++) {
+					if (k % 16 == 0) printf("%s%06x:", k ? "\n" : "", a + k);
+					printf(" %02x", guasa_read_mem(a + k));
+				}
+				printf("\n");
+			} else if (sscanf(line, "bmp %399s", path) == 1) {
+				in[0] = in[1] = 0;
+				guasa_run_frame(in, 1);
+				record();
+				SaveBmp(path);
+			} else if (sscanf(line, "%u %x %x", &n, &a, &b) == 3) {
+				for (unsigned k = 0; k < n; k++) { in[0] = (uint16_t)a; in[1] = (uint16_t)b; guasa_run_frame(in, 0); record(); }
+			}
+		}
+		fclose(sc);
+		fclose(out);
 		guasa_exit();
 		return 0;
 	}

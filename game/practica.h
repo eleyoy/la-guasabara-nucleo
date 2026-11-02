@@ -33,6 +33,33 @@ const char* StanceName(int s);
 
 struct HistoryEntry { uint16_t in; int frames; };
 
+// The frame meter, like modern games: what each player does on every frame of an
+// exchange (startup, active, recovery, hit or block stun...), and who can act
+// first when it's over. Read from the game's RAM and its animation tables in ROM
+// (found with core_test frames):
+//   +0x03 state: 00 stand, 02 crouch, 04 jump, 08 guard, 0A attack, 0C special,
+//         0E hit/block stun or knockdown, 14 thrown; +0x04 its sub-state
+//   +0x1A pointer to the animation frame in ROM: +0x0C attack box (active),
+//         +0x16 = 1 after the last active frame (recovery)
+//   +0x47 hitstop counter, +0x4B stun type (06/08 = block), +0x63 held by a throw
+enum FrameKind : uint8_t { kFree, kStartup, kActive, kRecovery, kHitstun, kBlockstun, kDown, kAir, kThrow, kFrozen };
+
+class FrameMeter {
+public:
+	static constexpr int kMax = 150;   // frames kept of one exchange
+	std::vector<uint8_t> row[2];       // the exchange shown: one FrameKind per frame and player
+	bool done = true;                  // it's over: the numbers below are final
+	bool hasAdvantage = false;         // both took part (a hit or a block, not a whiff)
+	int advantage = 0;                 // for player 1: + means they can act first
+	int who = -1, startup = 0, active = 0, recovery = 0;   // the first attack in it and whose (0/1)
+	void Update();                     // after every frame of the fight
+	void Reset();                      // after loading a position: nothing pending
+private:
+	FrameKind Classify(int p);
+	void Finish();
+	uint8_t m_state[2] = {}, m_sub[2] = {}, m_stop[2] = {};   // last frame's
+};
+
 class Practice {
 public:
 	// Characters are picked first: the player's, then the rival's with the same control.
@@ -47,6 +74,8 @@ public:
 	bool refillLife = true, freezeClock = true, fullSuper = false;
 	int delay = 0;                  // frames the player's buttons arrive late (0-5)
 	bool showHistory = true;
+	bool showFrames = true;         // the frame meter
+	FrameMeter meter;
 	std::vector<uint16_t> tape;     // the rival's recorded buttons
 	size_t tapePos = 0;
 	std::deque<HistoryEntry> history[2];

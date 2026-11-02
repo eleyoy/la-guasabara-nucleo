@@ -54,13 +54,16 @@ struct Mapping { std::string name; Bind b[kActions]; };
 
 static std::map<std::string, Mapping> g_maps;   // by device id: "teclado" or the joystick's GUID
 
-static std::string MapsPath()
+// A file in %APPDATA%\La Guasabara\juego
+static std::string PrefFile(const char* name)
 {
 	char* dir = SDL_GetPrefPath("La Guasabara", "juego");
-	std::string p = std::string(dir ? dir : "") + "controles.txt";
+	std::string p = std::string(dir ? dir : "") + name;
 	SDL_free(dir);
 	return p;
 }
+
+static std::string MapsPath() { return PrefFile("controles.txt"); }
 
 static void LoadMaps()
 {
@@ -645,7 +648,87 @@ static void DrawHistory(const SDL_FRect& r, const std::deque<HistoryEntry>& h, b
 	}
 }
 
-struct MenuItem { std::string text, key; std::function<void(int)> act; };   // act(+1/-1): change it or do it
+// One row of the practice menu: what it is, its value (if it has one) and its key.
+// act(+1 / -1): do it, or change the value forward / back. A header only names a group.
+// The frame meter (practica.h): two rows of colored frames above the bottom bar,
+// like SFV: green startup, red active, blue recovery, yellow hit or block stun,
+// purple knocked down, grey free. Above them, the attack's numbers and the advantage.
+static void DrawFrameMeter(const SDL_FRect& r, const FrameMeter& m)
+{
+	if (m.row[0].empty()) return;
+	float s = r.h / 450 > 1 ? r.h / 450 : 1;
+	static const Uint8 colors[][3] = {
+		{ 70, 74, 90 },    // free
+		{ 60, 210, 110 },  // startup
+		{ 240, 60, 70 },   // active
+		{ 70, 130, 255 },  // recovery
+		{ 250, 210, 60 },  // hit stun
+		{ 250, 170, 40 },  // block stun
+		{ 170, 90, 230 },  // knocked down
+		{ 120, 190, 210 }, // in the air
+		{ 255, 46, 136 },  // throw
+		{ 35, 35, 45 },    // frozen (hitstop, only one of the two)
+	};
+	size_t n = m.row[0].size();
+	float label = 48 * s, cell = SDL_min(7 * s, (r.w - label - 20 * s) / FrameMeter::kMax), h = 10 * s;
+	float x0 = r.x + 8 * s + label, y0 = r.y + r.h - 14 * s - 2 * h - 44 * s;   // above the super meter
+	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 170);
+	SDL_FRect bg{ r.x + 4 * s, y0 - 14 * s, label + cell * n + 12 * s, 2 * h + 22 * s };
+	bg.w = SDL_max(bg.w, 330 * s);
+	SDL_RenderFillRect(g_ren, &bg);
+	for (int p = 0; p < 2; p++) {
+		float y = y0 + p * (h + 3 * s);
+		Text(r.x + 8 * s, y + 1 * s, s, p ? "RIVAL" : "TU", 220, 220, 220);
+		for (size_t i = 0; i < n; i++) {
+			const Uint8* c = colors[m.row[p][i] < 10 ? m.row[p][i] : 0];
+			SDL_SetRenderDrawColor(g_ren, c[0], c[1], c[2], 255);
+			SDL_FRect f{ x0 + i * cell, y, SDL_max(cell - 1, 1.0f), h };
+			SDL_RenderFillRect(g_ren, &f);
+		}
+	}
+	if (!m.done) return;
+	char t[96] = "";
+	if (m.who >= 0 && m.active)
+		snprintf(t, sizeof(t), "%s  Arranque %d  Activo %d  Recuperacion %d", m.who ? "Rival:" : "Tu golpe:", m.startup, m.active, m.recovery);
+	Text(r.x + 8 * s, y0 - 11 * s, s, t, 230, 230, 230);
+	if (m.hasAdvantage) {
+		char a[32];
+		snprintf(a, sizeof(a), "Ventaja %+d", m.advantage);
+		Uint8 g = m.advantage > 0 ? 255 : m.advantage < 0 ? 90 : 230, rr = m.advantage < 0 ? 255 : m.advantage > 0 ? 120 : 230;
+		Text(bg.x + bg.w - (8 + 8 * strlen(a)) * s, y0 - 11 * s, s, a, rr, g, m.advantage > 0 ? 140 : 90);
+	}
+}
+
+struct MenuItem {
+	std::string label, value, key;
+	std::function<void(int)> act;
+	bool header = false;
+};
+static MenuItem Header(const char* t) { MenuItem m; m.label = t; m.header = true; return m; }
+
+// Where the menu goes on the screen: the same numbers draw it and find what the mouse points at.
+struct MenuLayout { SDL_FRect box; float bs, row, top; };
+static MenuLayout LayMenu(const SDL_FRect& r, size_t n)
+{
+	float s = r.h / 450 > 1 ? r.h / 450 : 1;
+	float bs = SDL_min(s * 1.4f, (r.h - 30 * s) / (17.0f * n + 48));   // smaller if it doesn't fit
+	float row = 17 * bs, w = SDL_min(380 * bs, r.w - 20 * s), h = row * n + 48 * bs;
+	return { { r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, w, h }, bs, row, r.y + (r.h - h) / 2 + 26 * bs };
+}
+// The row under (x, y): its index, -1 for a header or the title, -2 outside the menu.
+static int MenuHit(const MenuLayout& L, const std::vector<MenuItem>& m, float x, float y)
+{
+	if (x < L.box.x || x > L.box.x + L.box.w || y < L.box.y || y > L.box.y + L.box.h) return -2;
+	int i = (int)SDL_floorf((y - L.top + 3 * L.bs) / L.row);
+	return i >= 0 && i < (int)m.size() && !m[i].header ? i : -1;
+}
+// The bottom bar's "MENU" button, for the mouse.
+static SDL_FRect MenuButton(const SDL_FRect& r)
+{
+	float s = r.h / 450 > 1 ? r.h / 450 : 1;
+	return { r.x + r.w - 62 * s, r.y + r.h - 14 * s, 62 * s, 14 * s };
+}
 
 static void DrawPractice(const Practice& P, const std::vector<MenuItem>* menu, int sel, const std::string& note)
 {
@@ -661,7 +744,8 @@ static void DrawPractice(const Practice& P, const std::vector<MenuItem>* menu, i
 	SDL_RenderFillRect(g_ren, &top);
 	SDL_RenderFillRect(g_ren, &bottom);
 	Text(r.x + 6 * s, r.y + 3 * s, s, P.Status().c_str(), 255, 220, 120);
-	Text(r.x + 6 * s, r.y + r.h - 11 * s, s, "MONEDA o Tab: menu    START: volver a la posicion    Esc: salir", 200, 200, 200);
+	Text(r.x + 6 * s, r.y + r.h - 11 * s, s, "MONEDA, Tab o clic derecho: menu    START: volver a la posicion    Esc: salir", 200, 200, 200);
+	if (P.showFrames && P.phase == Practice::Fight) DrawFrameMeter(r, P.meter);
 	if (P.showHistory && P.phase == Practice::Fight) {
 		DrawHistory(r, P.history[0], false, "TU");
 		if (P.controlRival || P.replay) DrawHistory(r, P.history[1], true, "RIVAL");
@@ -672,29 +756,72 @@ static void DrawPractice(const Practice& P, const std::vector<MenuItem>* menu, i
 		SDL_RenderFillRect(g_ren, &b);
 		Text(b.x + 8 * s, b.y + 7 * s, s, note.c_str(), 120, 255, 160);
 	}
+	SDL_FRect mb = MenuButton(r);
+	SDL_SetRenderDrawColor(g_ren, 255, 46, 136, 255);
+	SDL_RenderFillRect(g_ren, &mb);
+	Text(mb.x + 15 * s, mb.y + 3 * s, s, "MENU", 10, 10, 18);
 	if (menu) {
-		float bs = s * 1.4f, row = 17 * bs, w = 330 * bs, h = row * menu->size() + 34 * bs;
-		SDL_FRect box{ r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, w, h };
-		SDL_SetRenderDrawColor(g_ren, 10, 10, 18, 235);
-		SDL_RenderFillRect(g_ren, &box);
+		MenuLayout L = LayMenu(r, menu->size());
+		float bs = L.bs, w = L.box.w;
+		SDL_SetRenderDrawColor(g_ren, 10, 10, 18, 238);
+		SDL_RenderFillRect(g_ren, &L.box);
 		SDL_SetRenderDrawColor(g_ren, 255, 46, 136, 255);
-		SDL_RenderRect(g_ren, &box);
-		Text(box.x + 12 * bs, box.y + 8 * bs, bs, "PRACTICA - MENU", 255, 46, 136);
+		SDL_RenderRect(g_ren, &L.box);
+		Text(L.box.x + 12 * bs, L.box.y + 8 * bs, bs, "PRACTICA", 255, 46, 136);
 		for (size_t i = 0; i < menu->size(); i++) {
-			float y = box.y + 26 * bs + i * row;
-			if ((int)i == sel) {
+			const MenuItem& it = (*menu)[i];
+			float y = L.top + i * L.row;
+			if (it.header) {   // a group's name, small, with a line
+				Text(L.box.x + 12 * bs, y + 4 * bs, bs * 0.75f, it.label.c_str(), 255, 120, 180);
+				SDL_SetRenderDrawColor(g_ren, 90, 40, 70, 255);
+				SDL_RenderLine(g_ren, L.box.x + 12 * bs + it.label.size() * 6 * bs + 6 * bs, y + 7 * bs, L.box.x + w - 12 * bs, y + 7 * bs);
+				continue;
+			}
+			bool on = (int)i == sel;
+			if (on) {
 				SDL_SetRenderDrawColor(g_ren, 255, 46, 136, 255);
-				SDL_FRect hl{ box.x + 6 * bs, y - 3 * bs, w - 12 * bs, row - 2 * bs };
+				SDL_FRect hl{ L.box.x + 6 * bs, y - 3 * bs, w - 12 * bs, L.row - 2 * bs };
 				SDL_RenderFillRect(g_ren, &hl);
 			}
-			Uint8 c = (int)i == sel ? 10 : 230;
-			Text(box.x + 12 * bs, y + 1 * bs, bs, (*menu)[i].text.c_str(), c, c, (int)i == sel ? 18 : 230);
-			const std::string& k = (*menu)[i].key;
-			if (!k.empty()) Text(box.x + w - (12 + 8 * k.size()) * bs, y + 1 * bs, bs, k.c_str(), (int)i == sel ? 10 : 150, (int)i == sel ? 10 : 150, (int)i == sel ? 18 : 170);
+			Uint8 c = on ? 10 : 235;
+			Text(L.box.x + 16 * bs, y + 1 * bs, bs, it.label.c_str(), c, c, on ? 18 : 235);
+			if (!it.value.empty()) {   // the value: green yes, grey no, yellow the rest; arrows on the selected one
+				bool yes = it.value == "si", no = it.value == "no" || it.value == "no hay";
+				std::string v = on ? "< " + it.value + " >" : it.value;
+				Uint8 vr = on ? 10 : yes ? 120 : no ? 150 : 255, vg = on ? 10 : yes ? 255 : no ? 150 : 210, vb = on ? 18 : yes ? 160 : no ? 160 : 90;
+				Text(L.box.x + w * 0.64f, y + 1 * bs, bs, v.c_str(), vr, vg, vb);
+			}
+			if (!it.key.empty())
+				Text(L.box.x + w - (12 + 8 * it.key.size()) * bs, y + 1 * bs, bs, it.key.c_str(), on ? 60 : 130, on ? 10 : 130, on ? 40 : 150);
 		}
-		Text(box.x + 12 * bs, box.y + h - 12 * bs, s, "Arriba/abajo: elegir   Golpe: cambiar   Patada: cerrar", 170, 170, 170);
+		Text(L.box.x + 12 * bs, L.box.y + L.box.h - 13 * bs, bs * 0.75f,
+		     "Flechas: elegir  Golpe/clic: cambiar  Patada/Esc: cerrar", 170, 170, 170);
 	}
 	SDL_RenderPresent(g_ren);
+}
+
+// The practice options are kept for next time (practica.txt), one "name value" a line.
+static void PracticeOptions(Practice& P, bool save)
+{
+	struct { const char* name; int* i; bool* b; } opts[] = {
+		{ "rival", &P.stance, NULL }, { "delay", &P.delay, NULL }, { "vida", NULL, &P.refillLife }, { "reloj", NULL, &P.freezeClock },
+		{ "super", NULL, &P.fullSuper }, { "historial", NULL, &P.showHistory }, { "medidor", NULL, &P.showFrames },
+	};
+	std::string path = PrefFile("practica.txt");
+	FILE* f = fopen(path.c_str(), save ? "w" : "r");
+	if (!f) return;
+	if (save) {
+		for (auto& o : opts) fprintf(f, "%s %d\n", o.name, o.i ? *o.i : (int)*o.b);
+	} else {
+		char name[32];
+		int v;
+		while (fscanf(f, "%31s %d", name, &v) == 2)
+			for (auto& o : opts)
+				if (!strcmp(name, o.name)) { if (o.i) *o.i = v; else *o.b = v != 0; }
+		if (P.stance < 0 || P.stance >= kStances) P.stance = kStand;
+		if (P.delay < 0 || P.delay > 5) P.delay = 0;
+	}
+	fclose(f);
 }
 
 // For checking the screen without hands: "captura=<folder>" plays a fixed script
@@ -717,6 +844,7 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 	guasa_boot_to_select();
 	Practice P;
 	P.Start();
+	if (shots.empty()) PracticeOptions(P, false);   // the script always starts the same
 	if (!OpenWindow("La Guasabara - Practica")) return 1;
 	LoadMaps();
 	printf("practica\n");
@@ -733,26 +861,40 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 	uint16_t lastLocal = 0;
 	auto yesNo = [](bool b) { return std::string(b ? "si" : "no"); };
 	std::vector<MenuItem> menu;
+	auto item = [](std::string label, std::string value, std::string key, std::function<void(int)> act) {
+		MenuItem m; m.label = std::move(label); m.value = std::move(value); m.key = std::move(key); m.act = std::move(act); return m;
+	};
 	auto buildMenu = [&]() {
 		menu = {
-			{ "Volver a la posicion", "START  F8", [&](int) { if (P.LoadPosition()) menuOpen = false; } },
-			{ "Guardar esta posicion", "F7", [&](int) { P.SavePosition(); say("Posicion guardada"); } },
-			{ std::string("Rival: ") + StanceName(P.stance), "F4", [&](int d) { P.stance = (P.stance + d + kStances) % kStances; P.replay = false; } },
-			{ P.rec == Practice::Recording ? "Parar la grabacion" : "Grabar al rival (tu lo mueves)", "F5",
-			  [&](int) { P.ToggleRecord(); menuOpen = false; } },
-			{ "Repetir la grabacion: " + yesNo(P.replay), "F6", [&](int) { if (!P.tape.empty()) P.replay = !P.replay; } },
-			{ "Mover al rival tu mismo: " + yesNo(P.controlRival), "F3", [&](int) { if (P.rec == Practice::NoRec) P.controlRival = !P.controlRival; } },
-			{ "Rival con otro control: " + (g_devs.size() < 2 ? std::string("no hay") : yesNo(secondControl)), "",
-			  [&](int) { secondControl = !secondControl && g_devs.size() >= 2; } },
-			{ "Vida que se recupera: " + yesNo(P.refillLife), "", [&](int) { P.refillLife = !P.refillLife; } },
-			{ "Tiempo infinito: " + yesNo(P.freezeClock), "", [&](int) { P.freezeClock = !P.freezeClock; } },
-			{ "Super siempre llena: " + yesNo(P.fullSuper), "", [&](int) { P.fullSuper = !P.fullSuper; } },
-			{ "Delay como en linea: " + std::to_string(P.delay), "F9", [&](int d) { P.delay = (P.delay + d + 6) % 6; } },
-			{ "Historial de botones: " + yesNo(P.showHistory), "F2", [&](int) { P.showHistory = !P.showHistory; } },
-			{ "Cambiar de personajes", "F10", [&](int) { P.ChangeCharacters(); menuOpen = false; } },
-			{ "Salir de la practica", "Esc", [&](int) { quit = true; } },
+			Header("POSICION"),
+			item("Volver a la posicion", "", "START F8", [&](int) { if (P.LoadPosition()) menuOpen = false; }),
+			item("Guardar esta posicion", "", "F7", [&](int) { P.SavePosition(); say("Posicion guardada"); }),
+			Header("RIVAL"),
+			item("Que hace", StanceName(P.stance), "F4", [&](int d) { P.stance = (P.stance + d + kStances) % kStances; P.replay = false; }),
+			item(P.rec == Practice::Recording ? "Parar la grabacion" : "Grabarlo (tu lo mueves)", "", "F5", [&](int) { P.ToggleRecord(); menuOpen = false; }),
+			item("Repetir la grabacion", P.tape.empty() ? "no hay" : yesNo(P.replay), "F6", [&](int) { if (!P.tape.empty()) P.replay = !P.replay; }),
+			item("Moverlo tu mismo", yesNo(P.controlRival), "F3", [&](int) { if (P.rec == Practice::NoRec) P.controlRival = !P.controlRival; }),
+			item("Con otro control", g_devs.size() < 2 ? "no hay" : yesNo(secondControl), "", [&](int) { secondControl = !secondControl && g_devs.size() >= 2; }),
+			Header("AYUDAS"),
+			item("Vida que se recupera", yesNo(P.refillLife), "", [&](int) { P.refillLife = !P.refillLife; }),
+			item("Tiempo infinito", yesNo(P.freezeClock), "", [&](int) { P.freezeClock = !P.freezeClock; }),
+			item("Super siempre llena", yesNo(P.fullSuper), "", [&](int) { P.fullSuper = !P.fullSuper; }),
+			item("Delay como en linea", std::to_string(P.delay), "F9", [&](int d) { P.delay = (P.delay + d + 6) % 6; }),
+			Header("PANTALLA"),
+			item("Historial de botones", yesNo(P.showHistory), "F2", [&](int) { P.showHistory = !P.showHistory; }),
+			item("Medidor de frames", yesNo(P.showFrames), "F12", [&](int) { P.showFrames = !P.showFrames; }),
+			Header("SALIR"),
+			item("Cambiar de personajes", "", "F10", [&](int) { P.ChangeCharacters(); menuOpen = false; }),
+			item("Salir de la practica", "", "Esc", [&](int) { quit = true; }),
 		};
 	};
+	// the next row that isn't a group's name, going up (d = -1) or down (+1)
+	auto step = [&](int from, int d) {
+		int n = (int)menu.size(), i = from;
+		do i = (i + d + n) % n; while (menu[i].header && i != from);
+		return i;
+	};
+	auto openMenu = [&](bool open) { menuOpen = open; buildMenu(); sel = step((int)menu.size() - 1, 1); };
 
 	const Uint64 frameNs = (Uint64)(1e9 / guasa_fps());
 	Uint64 next = SDL_GetTicksNS();
@@ -768,7 +910,7 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 				if (ev.key.repeat) break;
 				switch (ev.key.scancode) {
 				case SDL_SCANCODE_ESCAPE: if (menuOpen) menuOpen = false; else quit = true; break;
-				case SDL_SCANCODE_TAB: menuOpen = !menuOpen; sel = 0; break;
+				case SDL_SCANCODE_TAB: openMenu(!menuOpen); break;
 				case SDL_SCANCODE_F1: StartCapture(); break;
 				case SDL_SCANCODE_F2: P.showHistory = !P.showHistory; break;
 				case SDL_SCANCODE_F3: if (P.rec == Practice::NoRec) P.controlRival = !P.controlRival; break;
@@ -779,11 +921,35 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 				case SDL_SCANCODE_F8: P.LoadPosition(); break;
 				case SDL_SCANCODE_F9: P.delay = (P.delay + 1) % 6; say("Delay como en linea: " + std::to_string(P.delay)); break;
 				case SDL_SCANCODE_F10: P.ChangeCharacters(); break;
+				case SDL_SCANCODE_F12: P.showFrames = !P.showFrames; break;
 				default: break;
 				}
 				if (ev.key.scancode == SDL_SCANCODE_F11 || (ev.key.scancode == SDL_SCANCODE_RETURN && (ev.key.mod & SDL_KMOD_ALT)))
 					SDL_SetWindowFullscreen(g_win, !(SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN));
 				break;
+			// the mouse: pointing selects, left click does or changes, right click changes
+			// back, the wheel moves; a click outside closes it. Right click (or MENU) opens it.
+			case SDL_EVENT_MOUSE_MOTION:
+			case SDL_EVENT_MOUSE_BUTTON_DOWN:
+			case SDL_EVENT_MOUSE_WHEEL: {
+				SDL_ConvertEventToRenderCoordinates(g_ren, &ev);
+				SDL_FRect r = GameRect();
+				if (!menuOpen) {
+					SDL_FPoint pt{ ev.button.x, ev.button.y };
+					SDL_FRect mb = MenuButton(r);
+					if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && (ev.button.button == SDL_BUTTON_RIGHT || SDL_PointInRectFloat(&pt, &mb))) openMenu(true);
+					break;
+				}
+				buildMenu();
+				if (ev.type == SDL_EVENT_MOUSE_WHEEL) { sel = step(sel, ev.wheel.y > 0 ? -1 : 1); break; }
+				bool moved = ev.type == SDL_EVENT_MOUSE_MOTION;
+				int hit = MenuHit(LayMenu(r, menu.size()), menu, moved ? ev.motion.x : ev.button.x, moved ? ev.motion.y : ev.button.y);
+				if (hit >= 0) sel = hit;
+				if (moved) break;
+				if (hit == -2) menuOpen = false;
+				else if (hit >= 0) menu[hit].act(ev.button.button == SDL_BUTTON_RIGHT ? -1 : 1);
+				break;
+			}
 			}
 		}
 
@@ -802,7 +968,7 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 			if (k == 230) { DrawPractice(P, NULL, 0, "Posicion guardada"); SaveWindow(shots + "/practica-pelea.bmp"); }
 			if (k == 232) in[0] = GUASA_COIN;
 			if (k == 236) in[0] = GUASA_DOWN;
-			if (k == 240) { buildMenu(); DrawPractice(P, &menu, 1, ""); SaveWindow(shots + "/practica-menu.bmp"); quit = true; }
+			if (k == 240) { buildMenu(); DrawPractice(P, &menu, sel, ""); SaveWindow(shots + "/practica-menu.bmp"); quit = true; }
 		}
 		if (g_devs.size() < 2) secondControl = false;
 		int second = secondControl ? in[1] : -1;
@@ -810,11 +976,11 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 		lastLocal = local;
 
 		// MONEDA opens and closes the menu; START goes back to the saved position
-		if (pressed & GUASA_COIN) { menuOpen = !menuOpen; sel = 0; }
+		if (pressed & GUASA_COIN) openMenu(!menuOpen);
 		if (menuOpen) {
 			buildMenu();
-			if (pressed & GUASA_UP) sel = (sel + (int)menu.size() - 1) % (int)menu.size();
-			if (pressed & GUASA_DOWN) sel = (sel + 1) % (int)menu.size();
+			if (pressed & GUASA_UP) sel = step(sel, -1);
+			if (pressed & GUASA_DOWN) sel = step(sel, 1);
 			if (pressed & (GUASA_LK | GUASA_MK | GUASA_HK)) menuOpen = false;
 			else if (pressed & (GUASA_LP | GUASA_MP | GUASA_HP | GUASA_START | GUASA_RIGHT)) menu[sel].act(1);
 			else if (pressed & GUASA_LEFT) menu[sel].act(-1);
@@ -838,6 +1004,7 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 		if (next > now) SDL_DelayPrecise(next - now);
 		else if (now - next > 5 * frameNs) next = now;
 	}
+	if (shots.empty()) PracticeOptions(P, true);
 	CloseAll();
 	return 0;
 }
@@ -905,6 +1072,34 @@ static int PracticeSelfTest(const char* roms)
 	std::string without = knockdown(false), with = knockdown(true);
 	P.refillLife = true;
 	check(with == without, "derribado, el rival se levanta igual con la vida que se recupera");
+
+	// the frame meter, against what core_test frames measured for Ryu vs Ken
+	// (±1 frame: the game sometimes runs two ticks in one frame)
+	auto exchange = [&](int stance, uint16_t button) {
+		P.LoadPosition();
+		P.stance = stance;
+		run(100, GUASA_RIGHT);   // up against the rival
+		run(20, 0);
+		P.meter.Reset();
+		run(3, button);
+		int f = 0;
+		while (!P.meter.done && f++ < 300) frame(0);
+		const FrameMeter& m = P.meter;
+		return "arranque " + std::to_string(m.startup) + ", activo " + std::to_string(m.active) + ", recuperacion " +
+		       std::to_string(m.recovery) + ", ventaja " + (m.hasAdvantage ? std::to_string(m.advantage) : "-");
+	};
+	auto about = [](int v, int want) { return v >= want - 1 && v <= want + 1; };
+	std::string d = exchange(kStand, GUASA_LP);
+	const FrameMeter& M = P.meter;
+	check(M.done && M.who == 0 && about(M.startup, 4) && about(M.active, 4) && about(M.recovery, 4) && M.hasAdvantage && about(M.advantage, 3),
+	      "medidor: jab de pie que golpea, +3", d);
+	d = exchange(kBlock, GUASA_LP);
+	check(M.done && M.hasAdvantage && about(M.advantage, 4), "medidor: jab bloqueado, +4", d);
+	d = exchange(kBlock, GUASA_HP);
+	check(M.done && about(M.recovery, 20) && M.hasAdvantage && about(M.advantage, -7), "medidor: golpe fuerte bloqueado, -7", d);
+	d = exchange(kBlockLow, GUASA_DOWN | GUASA_HK);
+	check(M.done && about(M.startup, 4) && about(M.active, 5) && M.hasAdvantage && about(M.advantage, -6), "medidor: barrida bloqueada, -6", d);
+	P.stance = kStand;
 	check(guasa_read_ram(kClock) == 0x99, "el reloj se queda en 99");
 
 	// record the rival walking forward, then it repeats it from the same position

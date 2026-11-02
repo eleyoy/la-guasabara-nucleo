@@ -70,6 +70,10 @@ uint8_t guasa_read_ram(uint32_t address);
 /* Changes one byte of it. Practice mode only (infinite life and time): never
  * online, where both machines must run exactly the same game. */
 void guasa_write_ram(uint32_t address, uint8_t value);
+/* One byte as the 68000's data reads see it: program ROM (0x000000 up, the
+ * animation and hitbox tables) or work RAM; anything else reads 0. Read-only,
+ * for practice-mode tools such as the frame meter. */
+uint8_t guasa_read_mem(uint32_t address);
 
 /* The last drawn frame: RGB565, width x height, pitch in bytes. */
 const uint16_t* guasa_framebuffer(int* width, int* height, int* pitch);
