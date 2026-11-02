@@ -8,7 +8,8 @@
 //   guasa-game online <roms> <1|2> <local_port> (<ip:port> | relay=<host:port> token=<hex> [relayonly]) [delay=N|auto] [lag=MS] [jitter=MS] [loss=PCT]
 //                                online match (rollback, net.cpp); the keyboard and the
 //                                first control play this side
-//   guasa-game practica <roms>   practice mode (practica.h): the player against a rival
+//   guasa-game practica <roms> [escenario=cammy|practica|juego] [captura=<dir>]
+//                                practice mode (practica.h): the player against a rival
 //                                that stands, blocks or repeats a recording
 //   guasa-game practica-prueba <roms>   checks practice mode without a window
 //   guasa-game repeticion <roms> <file> [j1=<rank|->:<name>] [j2=...]   watches a replay
@@ -1329,7 +1330,7 @@ static void PracticeOptions(Practice& P, bool save)
 	struct { const char* name; int* i; bool* b; } opts[] = {
 		{ "rival", &P.stance, NULL }, { "delay", &P.delay, NULL }, { "vida", NULL, &P.refillLife }, { "reloj", NULL, &P.freezeClock },
 		{ "super", NULL, &P.fullSuper }, { "historial", NULL, &P.showHistory }, { "medidor", NULL, &P.showFrames },
-		{ "cajas", NULL, &P.showBoxes }, { "empuje", NULL, &P.showPush }, { "escenario", &P.stage, NULL },
+		{ "cajas", NULL, &P.showBoxes }, { "empuje", NULL, &P.showPush },
 	};
 	std::string path = PrefFile("practica.txt");
 	FILE* f = fopen(path.c_str(), save ? "w" : "r");
@@ -1344,7 +1345,6 @@ static void PracticeOptions(Practice& P, bool save)
 				if (!strcmp(name, o.name)) { if (o.i) *o.i = v; else *o.b = v != 0; }
 		if (P.stance < 0 || P.stance >= kStances) P.stance = kStand;
 		if (P.delay < 0 || P.delay > 5) P.delay = 0;
-		if (P.stage != 0x0C && P.stage != kOwnStage) P.stage = -1;
 	}
 	fclose(f);
 }
@@ -1357,7 +1357,9 @@ static void SaveWindow(const std::string& path)
 	if (s) { SDL_SaveBMP(s, path.c_str()); SDL_DestroySurface(s); }
 }
 
-static int PlayPractice(const char* roms, const std::string& shots = "")
+// stage: chosen in the app before opening (the game loads it with the fight, so
+// it isn't changed from inside): 0x0C Cammy's, kOwnStage practice's own, -1 the game's.
+static int PlayPractice(const char* roms, const std::string& shots, int stage)
 {
 	char msg[300] = "";
 	if (guasa_init(roms, msg, sizeof(msg))) {
@@ -1370,7 +1372,7 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 	Practice P;
 	P.Start();
 	if (shots.empty()) PracticeOptions(P, false);   // the script always starts the same
-	else if (SDL_getenv("GUASA_ESCENARIO_PROPIO")) P.stage = kOwnStage;   // the script's pictures with practice's own stage
+	P.stage = stage;
 	if (!OpenWindow("La Guasabara - Practica")) return 1;
 	LoadMaps();
 	printf("practica\n");
@@ -1408,13 +1410,6 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 			item("Delay como en linea", std::to_string(P.delay), "F9", [&](int d) { P.delay = (P.delay + d + 6) % 6; }),
 			Header("PANTALLA"),
 			item("Historial de botones", yesNo(P.showHistory), "F2", [&](int) { P.showHistory = !P.showHistory; }),
-			item("Escenario", P.stage == 0x0C ? "Cammy" : P.stage == kOwnStage ? "practica" : "el del juego", "", [&](int d) {
-				static const int order[3] = { 0x0C, kOwnStage, -1 };
-				int i = P.stage == 0x0C ? 0 : P.stage == kOwnStage ? 1 : 2;
-				int was = P.stage;
-				P.stage = order[(i + d + 3) % 3];
-				if ((was == -1) != (P.stage == -1) || (was == 0x0C && P.stage == -1)) say("El escenario cambia en la proxima pelea (F10)");
-			}),
 			item("Cajas de golpe", yesNo(P.showBoxes), "", [&](int) { P.showBoxes = !P.showBoxes; }),
 			item("Cajas de empuje", yesNo(P.showPush), "", [&](int) { P.showPush = !P.showPush; }),
 			item("Medidor de frames", yesNo(P.showFrames), "F12", [&](int) { P.showFrames = !P.showFrames; }),
@@ -2023,7 +2018,16 @@ int main(int argc, char** argv)
 		return n == 0 ? 0 : 1;
 	}
 	if (mode == "versus" || mode == "test") return Play(argv[2], mode == "test");
-	if (mode == "practica") return PlayPractice(argv[2], argc > 3 && strncmp(argv[3], "captura=", 8) == 0 ? argv[3] + 8 : "");
+	if (mode == "practica") {
+		std::string shots;
+		int stage = 0x0C;   // Cammy's, unless the app says otherwise
+		for (int i = 3; i < argc; i++) {
+			if (!strncmp(argv[i], "captura=", 8)) shots = argv[i] + 8;
+			if (!strcmp(argv[i], "escenario=practica")) stage = kOwnStage;
+			if (!strcmp(argv[i], "escenario=juego")) stage = -1;
+		}
+		return PlayPractice(argv[2], shots, stage);
+	}
 	if (mode == "practica-prueba") return PracticeSelfTest(argv[2]);
 	if (mode == "espectar") {
 		bool pause = false;
