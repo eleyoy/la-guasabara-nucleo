@@ -41,6 +41,26 @@ struct PauseState {
 	int32_t frames = 0;          // paused: frames so far; counting down: frames left
 };
 
+// One frame of the pause's rules, the same for both games and for replays.
+// in: both players' buttons (with kPauseBit). True = the game stays still this frame.
+bool PauseRule(PauseState& p, bool allowed, const uint16_t in[2]);
+
+// A replay: both players' buttons on every frame from the starting state
+// (character select, the same on every PC), pause bit included. With the same
+// core, playing them back gives exactly the same game.
+// File: "GUASAREP", version (u16) 1, flags (u16, 1 = the pause was allowed),
+// frames (u32), then per frame player 1's and player 2's buttons (u16 each);
+// all little-endian.
+struct Replay {
+	bool pause = false;
+	std::vector<uint32_t> frames;   // player 1 | player 2 << 16
+};
+bool SaveReplay(const std::string& path, const Replay& r);
+// One frame of a replay: the pause's rules, then the game (unless paused).
+// True if the game moved.
+bool ReplayFrame(const Replay& rep, size_t i, PauseState& ps, bool draw);
+bool LoadReplay(const std::string& path, Replay& r, std::string* error);
+
 class NetMatch {
 public:
 	enum Status { Waiting, Playing, Ended };
@@ -70,6 +90,9 @@ public:
 	// The buttons the game used on the last shown frame, both players.
 	const uint16_t* LastInputs() const { return m_lastInputs; }
 	const PauseState& Pause() const { return m_pause; }
+	// The set so far as a replay: the buttons the game used on each frame (a
+	// rollback rewrites the frames it redoes, so they end up as they were played).
+	Replay Recording() const;
 
 private:
 	struct GekkoSession* m_session = nullptr;
@@ -83,7 +106,8 @@ private:
 	std::string m_endReason;
 	uint16_t m_lastInputs[2] = { 0, 0 };
 	PauseState m_pause;
-	bool PauseFrame(const uint16_t in[2]);
+	std::vector<uint32_t> m_record;
+	int m_recordBase = -1;           // GekkoNet's number for the first frame
 };
 
 // The online options of the window and the bot, one per argument:

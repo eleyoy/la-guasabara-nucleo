@@ -1,6 +1,7 @@
 #include "net.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -162,8 +163,15 @@ NetMatch::Status NetMatch::Step(uint16_t localInput, bool draw, bool* shown)
 			const uint16_t* raw = (const uint16_t*)e->data.adv.inputs;
 			uint16_t in[2] = { (uint16_t)(raw[0] & ~kPauseBit), (uint16_t)(raw[1] & ~kPauseBit) };
 			bool rolling = e->data.adv.rolling_back;
+			// the replay: this frame's buttons (again, if a rollback redoes it)
+			if (m_recordBase < 0) m_recordBase = e->data.adv.frame;
+			size_t at = (size_t)(e->data.adv.frame - m_recordBase);
+			if (e->data.adv.frame >= m_recordBase) {
+				if (m_record.size() <= at) m_record.resize(at + 1, 0);
+				m_record[at] = raw[0] | (uint32_t)raw[1] << 16;
+			}
 			// paused: the game doesn't move this frame (the same on both PCs)
-			if (PauseFrame(raw)) { m_stats.frame = e->data.adv.frame; if (shown && !rolling) *shown = true; continue; }
+			if (PauseRule(m_pause, m_cfg.pause, raw)) { m_stats.frame = e->data.adv.frame; if (shown && !rolling) *shown = true; continue; }
 			// draw only frames that are shown; drawing doesn't change the state
 			guasa_run_frame(in, draw && !rolling);
 			if (rolling) { m_stats.resimulated++; m_run++; continue; }
@@ -195,25 +203,76 @@ NetMatch::Status NetMatch::Step(uint16_t localInput, bool draw, bool* shown)
 	return m_stats.started ? Playing : Waiting;
 }
 
-// One frame of the pause's rules, from both players' buttons. True = the game
-// stays still this frame.
-bool NetMatch::PauseFrame(const uint16_t in[2])
+bool PauseRule(PauseState& p, bool allowed, const uint16_t in[2])
 {
 	const int fps = (int)(guasa_fps() + 0.5);
 	bool asked[2] = { (in[0] & kPauseBit) != 0, (in[1] & kPauseBit) != 0 };
-	switch (m_pause.phase) {
+	switch (p.phase) {
 	case 0:
-		if (!m_cfg.pause || !(asked[0] || asked[1])) return false;
-		m_pause = { 1, asked[0] ? 0 : 1, 0 };
+		if (!allowed || !(asked[0] || asked[1])) return false;
+		p = { 1, asked[0] ? 0 : 1, 0 };
 		return true;
 	case 1:
-		if (++m_pause.frames >= 5 * 60 * fps) m_pause = { 2, m_pause.by, 10 * fps };   // 5 minutes: 10 s and on
-		else if ((asked[0] || asked[1]) && m_pause.frames > fps / 2) m_pause = { 2, m_pause.by, 3 * fps };   // asked to go on: 3 s
+		if (++p.frames >= 5 * 60 * fps) p = { 2, p.by, 10 * fps };   // 5 minutes: 10 s and on
+		else if ((asked[0] || asked[1]) && p.frames > fps / 2) p = { 2, p.by, 3 * fps };   // asked to go on: 3 s
 		return true;
 	default:
-		if (--m_pause.frames <= 0) m_pause = PauseState();
+		if (--p.frames <= 0) p = PauseState();
 		return true;
 	}
+}
+
+Replay NetMatch::Recording() const
+{
+	Replay r;
+	r.pause = m_cfg.pause;
+	r.frames = m_record;
+	return r;
+}
+
+bool ReplayFrame(const Replay& rep, size_t i, PauseState& ps, bool draw)
+{
+	uint16_t raw[2] = { (uint16_t)rep.frames[i], (uint16_t)(rep.frames[i] >> 16) };
+	if (PauseRule(ps, rep.pause, raw)) return false;
+	uint16_t in[2] = { (uint16_t)(raw[0] & ~kPauseBit), (uint16_t)(raw[1] & ~kPauseBit) };
+	guasa_run_frame(in, draw);
+	return true;
+}
+
+static void Put16(std::vector<uint8_t>& b, uint16_t v) { b.push_back((uint8_t)v); b.push_back((uint8_t)(v >> 8)); }
+
+bool SaveReplay(const std::string& path, const Replay& r)
+{
+	std::vector<uint8_t> b = { 'G', 'U', 'A', 'S', 'A', 'R', 'E', 'P' };
+	Put16(b, 1);
+	Put16(b, r.pause ? 1 : 0);
+	uint32_t n = (uint32_t)r.frames.size();
+	Put16(b, (uint16_t)n);
+	Put16(b, (uint16_t)(n >> 16));
+	for (uint32_t f : r.frames) { Put16(b, (uint16_t)f); Put16(b, (uint16_t)(f >> 16)); }
+	FILE* fp = fopen(path.c_str(), "wb");
+	if (!fp) return false;
+	bool ok = fwrite(b.data(), 1, b.size(), fp) == b.size();
+	return fclose(fp) == 0 && ok;
+}
+
+bool LoadReplay(const std::string& path, Replay& r, std::string* error)
+{
+	FILE* fp = fopen(path.c_str(), "rb");
+	if (!fp) { if (error) *error = "no se pudo abrir la repeticion"; return false; }
+	std::vector<uint8_t> b;
+	uint8_t chunk[65536];
+	size_t got;
+	while ((got = fread(chunk, 1, sizeof(chunk), fp)) > 0) b.insert(b.end(), chunk, chunk + got);
+	fclose(fp);
+	auto u16 = [&](size_t at) { return (uint32_t)(b[at] | b[at + 1] << 8); };
+	if (b.size() < 16 || memcmp(b.data(), "GUASAREP", 8) || u16(8) != 1) { if (error) *error = "no es una repeticion de La Guasabara"; return false; }
+	uint32_t n = u16(12) | u16(14) << 16;
+	if (b.size() != 16 + (size_t)n * 4) { if (error) *error = "la repeticion esta incompleta"; return false; }
+	r.pause = (u16(10) & 1) != 0;
+	r.frames.resize(n);
+	for (uint32_t i = 0; i < n; i++) r.frames[i] = u16(16 + i * 4) | u16(18 + i * 4) << 16;
+	return true;
 }
 
 double NetMatch::PaceFactor() const

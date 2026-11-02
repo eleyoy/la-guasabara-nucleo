@@ -37,7 +37,23 @@ static uint16_t BotInput(int frame, uint64_t& rng)
 int main(int argc, char** argv)
 {
 	NetConfig cfg;
+	// guasa-bot <roms> repeticion <file>: plays a replay without a window and says
+	// its final state (the automatic checks compare it with the game that recorded it)
+	if (argc == 4 && !strcmp(argv[2], "repeticion")) {
+		Replay rep;
+		std::string err;
+		if (!LoadReplay(argv[3], rep, &err)) { printf("error: %s\n", err.c_str()); return 1; }
+		char msg[300] = "";
+		if (guasa_init(argv[1], msg, sizeof(msg))) { printf("error: %s\n", msg); return 1; }
+		guasa_boot_to_select();
+		PauseState ps;
+		for (size_t i = 0; i < rep.frames.size(); i++) ReplayFrame(rep, i, ps, false);
+		printf("repeticion: %zu cuadros, estado final %016llx\n", rep.frames.size(), (unsigned long long)guasa_state_hash());
+		guasa_exit();
+		return 0;
+	}
 	int frames = 0, pauseAt = -1, resumeAt = -1;   // pausaen=N seguiren=N: ask for the pause / to go on, at those frames (tests)
+	std::string recordTo;                          // grabar=<file>: save the replay at the end (tests)
 	uint64_t rng = 0;
 	if (argc >= 4) {
 		cfg.local = atoi(argv[2]) - 1;
@@ -48,6 +64,7 @@ int main(int argc, char** argv)
 		if (!strncmp(argv[i], "frames=", 7)) frames = atoi(argv[i] + 7);
 		else if (!strncmp(argv[i], "seed=", 5)) rng = strtoull(argv[i] + 5, NULL, 10);
 		else if (!strncmp(argv[i], "pausaen=", 8)) pauseAt = atoi(argv[i] + 8);
+		else if (!strncmp(argv[i], "grabar=", 7)) recordTo = argv[i] + 7;
 		else if (!strncmp(argv[i], "seguiren=", 9)) resumeAt = atoi(argv[i] + 9);
 		else if (!ParseNetArg(argv[i], cfg)) { fprintf(stderr, "opcion desconocida: %s\n", argv[i]); return 2; }
 	}
@@ -123,6 +140,11 @@ int main(int argc, char** argv)
 	       s.frame, secs, s.frame / (secs > 0 ? secs : 1), s.rollbacks, s.resimulated, s.maxRollback,
 	       pingN ? pingSum / pingN : 0.0, pingMax, s.delay, s.desyncs);
 	if (s.desyncs) printf("primera desincronizacion en el cuadro %d\n", s.firstDesync);
+	if (!recordTo.empty()) {   // the replay, and the state it must lead to
+		Replay rep = net.Recording();
+		printf("repeticion %s: %zu cuadros, estado final %016llx\n", SaveReplay(recordTo, rep) ? "guardada" : "NO guardada",
+		       rep.frames.size(), (unsigned long long)guasa_state_hash());
+	}
 	net.Stop();
 	guasa_exit();
 	return s.desyncs ? 1 : 0;
