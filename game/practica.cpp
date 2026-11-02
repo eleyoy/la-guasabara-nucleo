@@ -12,6 +12,12 @@ const char* StanceName(int s)
 	return s >= 0 && s < kStances ? names[s] : "";
 }
 
+const char* ReactionName(int r)
+{
+	static const char* names[kReactions] = { "nada", "la grabacion", "salta atras", "barrida", "golpe fuerte" };
+	return r >= 0 && r < kReactions ? names[r] : "";
+}
+
 uint16_t ReadWord(uint32_t a)
 {
 	return (uint16_t)(guasa_read_ram(a) << 8 | guasa_read_ram(a + 1));
@@ -64,6 +70,33 @@ FrameKind FrameMeter::Classify(int p)
 	if (st == 0x08 && m_state[p] == 0x0E) return kBlockstun;   // one more frame after blocking
 	if (st == 0x04) return sub == 0x04 && m_state[p] == 0x04 && m_sub[p] == 0x04 ? kFree : kAir;   // landing: free from its 2nd frame
 	return kFree;
+}
+
+void ComboCounter::Update()
+{
+	int life = (int16_t)ReadWord(kP2 + kLife);
+	if (life < 0) life = 0;   // a K.O. can take it under 0
+	uint8_t st = guasa_read_ram(kP2 + 3), how = guasa_read_ram(kP2 + 0x4B);
+	bool blocking = (st == 0x0E && (how == 0x06 || how == 0x08)) || st == 0x08;
+	bool caught = (st == 0x0E && !blocking) || st == 0x14 || guasa_read_ram(kP2 + 0x63);
+	if (life < m_life && !blocking) {   // a hit
+		if (!live) { hits = damage = 0; live = true; }
+		hits++;
+		damage += m_life - life;
+		if (damage > bestDamage || (damage == bestDamage && hits > bestHits)) { bestHits = hits; bestDamage = damage; }
+	} else if (live && !caught) {   // free again: the combo is over
+		live = false;
+		shownFor = 180;
+	}
+	if (!live && shownFor > 0) shownFor--;
+	m_life = life;
+}
+
+void ComboCounter::Reset()
+{
+	if (live) { live = false; shownFor = 180; }   // the one going on stays on screen a while
+	int life = (int16_t)ReadWord(kP2 + kLife);
+	m_life = life < 0 ? 0 : life;
 }
 
 static int16_t S16(uint32_t a) { return (int16_t)(guasa_read_mem(a) << 8 | guasa_read_mem(a + 1)); }
@@ -183,6 +216,12 @@ bool Practice::RivalOnRight() const
 
 uint16_t Practice::Rival(uint16_t)
 {
+	if (!m_seq.empty()) {   // a reversal on its way
+		int k = m_seqFrame++ - m_seqStart;
+		if (k >= (int)m_seq.size()) m_seq.clear();
+		else if (k >= 0) return m_seq[k];
+		else return 0;
+	}
 	if (replay && !tape.empty()) {
 		uint16_t v = tape[tapePos++ % tape.size()];
 		return RivalOnRight() == m_tapeOnRight ? v : Mirror(v);
@@ -198,6 +237,60 @@ uint16_t Practice::Rival(uint16_t)
 	case kBlockAfterHit: return m_blockFor > 0 ? GUASA_DOWN | away : 0;
 	default: return 0;
 	}
+}
+
+// Knocked down (or thrown), or blocking: the moments a reversal follows.
+Practice::Moment Practice::RivalMoment() const
+{
+	uint8_t st = guasa_read_ram(kP2 + 3), sub = guasa_read_ram(kP2 + 4), how = guasa_read_ram(kP2 + 0x4B);
+	if (st == 0x0E && (how == 0x06 || how == 0x08)) return kBlockingNow;
+	if (st == 0x14 || guasa_read_ram(kP2 + 0x63) || (st == 0x0E && sub != 0x02)) return kDownNow;
+	return kNone;
+}
+
+// The rival's first free frame, found by playing ahead from a copy of the state
+// (nobody pressing anything), then the reversal's buttons placed so that its
+// button comes 1 frame before it (the game keeps it, and does the move on that
+// first frame).
+void Practice::PlanReversal(int what)
+{
+	m_seq.clear();
+	std::vector<uint8_t> now(guasa_state_size());
+	guasa_save(now.data(), now.size());
+	int free = -1;
+	for (int i = 0; i < 240 && free < 0; i++) {
+		uint16_t none[2] = { 0, 0 };
+		guasa_run_frame(none, 0);
+		uint8_t st = guasa_read_ram(kP2 + 3);
+		if (st != 0x0E && st != 0x14 && !guasa_read_ram(kP2 + 0x63)) free = i;
+	}
+	guasa_load(now.data(), now.size());
+	if (free < 0) return;
+	const uint16_t back = RivalOnRight() ? GUASA_RIGHT : GUASA_LEFT;
+	std::vector<uint16_t> seq;
+	int anchor = 0;   // the frame of seq that must come 1 frame before the first free one
+	switch (what) {
+	case kReactTape: {
+		if (tape.empty()) return;
+		bool flip = RivalOnRight() != m_tapeOnRight;
+		size_t first = 0, button = tape.size();
+		while (first < tape.size() && !tape[first]) first++;   // what was recorded before moving: nothing
+		for (size_t i = first; i < tape.size() && button == tape.size(); i++) if (tape[i] & kButtons) button = i;
+		if (first == tape.size()) return;
+		if (button == tape.size()) button = first;   // only moving (a jump, a dash): from its first frame
+		if (button - first > 20) first = button - 20;   // a special's motion is shorter than that
+		for (size_t i = first; i < tape.size(); i++) seq.push_back(flip ? Mirror(tape[i]) : tape[i]);
+		anchor = (int)(button - first);
+		break;
+	}
+	case kReactJumpBack: seq.assign(4, (uint16_t)(GUASA_UP | back)); break;
+	case kReactSweep: seq.assign(4, (uint16_t)(GUASA_DOWN | GUASA_HK)); break;
+	case kReactHeavy: seq.assign(4, (uint16_t)GUASA_HP); break;
+	default: return;
+	}
+	m_seq = seq;
+	m_seqFrame = 0;
+	m_seqStart = free - 1 - anchor;   // can be under 0: the start of the motion is lost, the button still comes in time
 }
 
 // The player is attacking (state 0A normal, 0C special, or a jump attack), or a fireball is out.
@@ -262,8 +355,21 @@ void Practice::AfterFrame(const uint16_t used[2])
 	// the boxes of this frame; the picture shows them two frames from now
 	m_boxes.pop_front();
 	m_boxes.push_back(phase == Fight && (showBoxes || showPush) ? ComputeBoxes() : std::vector<Box>());
+	if (started) { combo = ComboCounter(); combo.Reset(); }
 	if (phase == Fight) {
 		meter.Update();
+		combo.Update();
+		// a reversal: planned when the rival is knocked down or starts blocking
+		// (again on each new hit or block, which changes when it gets free)
+		Moment m = RivalMoment();
+		uint8_t stop = guasa_read_ram(kP2 + 0x47);   // hitstop: set on every hit and every block
+		bool fresh = m != kNone && (m != m_moment || (stop && !m_stop2));
+		m_stop2 = stop;
+		if (fresh && !controlRival && rec == NoRec) {
+			int what = m == kDownNow ? onWake : onBlock;
+			if (what != kReactNothing) PlanReversal(what);
+		}
+		m_moment = m;
 		if (freezeClock) guasa_write_ram(kClock, 0x99);
 		if (fullSuper) { guasa_write_ram(kP1 + kSuper, kFullSuper); guasa_write_ram(kP2 + kSuper, kFullSuper); }
 		for (int p = 0; p < 2; p++) {
@@ -325,6 +431,9 @@ bool Practice::LoadPosition()
 	m_blockFor = 0;
 	tapePos = 0;   // the recording starts over with the position
 	meter.Reset();
+	combo.Reset();
+	m_seq.clear();   // a reversal planned before going back: not anymore
+	m_moment = kNone;
 	return true;
 }
 
@@ -354,6 +463,8 @@ std::string Practice::Status() const
 	else if (controlRival) s += "lo mueves tu";
 	else if (replay && !tape.empty()) s += "repite la grabacion";
 	else s += StanceName(stance);
+	if (onWake) s += std::string("   al levantarse: ") + ReactionName(onWake);
+	if (onBlock) s += std::string("   tras bloquear: ") + ReactionName(onBlock);
 	if (delay) s += "   delay " + std::to_string(delay);
 	return s;
 }

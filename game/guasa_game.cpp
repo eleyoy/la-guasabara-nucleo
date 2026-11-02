@@ -1230,6 +1230,50 @@ static void Arrow(float cx, float cy, float len, uint16_t in, Uint8 r, Uint8 g, 
 
 // One column per player: newest on top, how many frames each input lasted, the
 // direction as an arrow and the buttons pressed.
+static int PercentOfLife(int points) { return (points * 100 + kFullLife / 2) / kFullLife; }   // of a full bar, rounded
+
+// The combo counter, under the player's life bar past the button history:
+// "3 GOLPES" big and the damage (and how much of a full life bar it is).
+// A finished combo stays a while, dimmer.
+static void DrawCombo(const SDL_FRect& r, const ComboCounter& c)
+{
+	if (c.hits < 1 || (!c.live && c.shownFor <= 0)) return;
+	float s = r.h / 450 > 1 ? r.h / 450 : 1, big = s * 1.75f;
+	char hits[32], dmg[48];
+	snprintf(hits, sizeof(hits), "%d %s", c.hits, c.hits == 1 ? "GOLPE" : "GOLPES");
+	snprintf(dmg, sizeof(dmg), "DANO %d  (%d%%)", c.damage, PercentOfLife(c.damage));
+	float w = SDL_max(strlen(hits) * 8 * big, strlen(dmg) * 8 * s) + 16 * s, h = 36 * s;
+	float x = r.x + 118 * s, y = r.y + 68 * s;   // clear of the clock in the middle
+	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, c.live ? 150 : 100);
+	SDL_FRect b{ x, y, w, h };
+	SDL_RenderFillRect(g_ren, &b);
+	Uint8 k = c.live ? 255 : 170;
+	Text(x + 8 * s, y + 6 * s, big, hits, k, c.live ? 220 : 150, c.live ? 80 : 60);
+	Text(x + 8 * s, y + 26 * s, s, dmg, k, k, k);
+}
+
+// Under the rival's life bar, always there: its life in points (the bar has no
+// numbers) and the best combo the player did on it in this fight, which stays.
+static void DrawRivalBox(const SDL_FRect& r, const ComboCounter& c)
+{
+	float s = r.h / 450 > 1 ? r.h / 450 : 1, ts = s * 0.9f;
+	int life = SDL_max((int)(int16_t)ReadWord(kP2 + kLife), 0);
+	char l1[40], l2[40];
+	snprintf(l1, sizeof(l1), "VIDA %d / %d", life, kFullLife);
+	if (c.bestHits) snprintf(l2, sizeof(l2), "%d %s  %d (%d%%)", c.bestHits, c.bestHits == 1 ? "GOLPE" : "GOLPES", c.bestDamage, PercentOfLife(c.bestDamage));
+	else snprintf(l2, sizeof(l2), "todavia ninguno");
+	float w = SDL_max(SDL_max(strlen(l1) * 8 * s * 1.25f, strlen(l2) * 8 * ts), 11 * 8 * ts) + 16 * s, h = 44 * s;
+	float x = r.x + r.w - 106 * s - w, y = r.y + 68 * s;   // between the clock and the rival's portrait
+	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 140);
+	SDL_FRect b{ x, y, w, h };
+	SDL_RenderFillRect(g_ren, &b);
+	Text(x + 8 * s, y + 5 * s, s * 1.25f, l1, 255, 255, 255);
+	Text(x + 8 * s, y + 20 * s, ts, "MEJOR COMBO", 150, 200, 255);
+	Text(x + 8 * s, y + 31 * s, ts, l2, c.bestHits ? 255 : 160, c.bestHits ? 220 : 160, c.bestHits ? 80 : 160);
+}
+
 static void DrawHistory(const SDL_FRect& r, const std::deque<HistoryEntry>& h, bool right, const char* title)
 {
 	// narrow (as wide as its widest row) and see-through, so it hides little
@@ -1447,6 +1491,7 @@ static void DrawPractice(const Practice& P, const std::vector<MenuItem>* menu, i
 		}
 	}
 	if (P.showFrames && P.phase == Practice::Fight) DrawFrameMeter(r, P.meter);
+	if (P.showCombo && P.phase == Practice::Fight) { DrawCombo(r, P.combo); DrawRivalBox(r, P.combo); }
 	if (P.showHistory && P.phase == Practice::Fight) {
 		DrawHistory(r, P.history[0], false, "TU");
 		if (P.controlRival || P.replay) DrawHistory(r, P.history[1], true, "RIVAL");
@@ -1507,7 +1552,8 @@ static void PracticeOptions(Practice& P, bool save)
 	struct { const char* name; int* i; bool* b; } opts[] = {
 		{ "rival", &P.stance, NULL }, { "delay", &P.delay, NULL }, { "vida", NULL, &P.refillLife }, { "reloj", NULL, &P.freezeClock },
 		{ "super", NULL, &P.fullSuper }, { "historial", NULL, &P.showHistory }, { "medidor", NULL, &P.showFrames },
-		{ "cajas", NULL, &P.showBoxes }, { "empuje", NULL, &P.showPush },
+		{ "cajas", NULL, &P.showBoxes }, { "empuje", NULL, &P.showPush }, { "combos", NULL, &P.showCombo },
+		{ "levantarse", &P.onWake, NULL }, { "bloquear", &P.onBlock, NULL },
 	};
 	std::string path = PrefFile("practica.txt");
 	FILE* f = fopen(path.c_str(), save ? "w" : "r");
@@ -1522,12 +1568,15 @@ static void PracticeOptions(Practice& P, bool save)
 				if (!strcmp(name, o.name)) { if (o.i) *o.i = v; else *o.b = v != 0; }
 		if (P.stance < 0 || P.stance >= kStances) P.stance = kStand;
 		if (P.delay < 0 || P.delay > 5) P.delay = 0;
+		if (P.onWake < 0 || P.onWake >= kReactions) P.onWake = kReactNothing;
+		if (P.onBlock < 0 || P.onBlock >= kReactions) P.onBlock = kReactNothing;
 	}
 	fclose(f);
 }
 
 // For checking the screen without hands: "captura=<folder>" plays a fixed script
-// (pick, walk up, a few hits) and saves practica-pelea.bmp and practica-menu.bmp.
+// (pick, walk up, a few hits, a combo) and saves practica-combo.bmp, practica-pelea.bmp
+// and practica-menu.bmp.
 static void SaveWindow(const std::string& path)
 {
 	SDL_Surface* s = SDL_RenderReadPixels(g_ren, NULL);
@@ -1576,6 +1625,8 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 			item("Guardar esta posicion", "", "F7", [&](int) { P.SavePosition(); say("Posicion guardada"); }),
 			Header("RIVAL"),
 			item("Que hace", StanceName(P.stance), "F4", [&](int d) { P.stance = (P.stance + d + kStances) % kStances; P.replay = false; }),
+			item("Al levantarse", ReactionName(P.onWake), "", [&](int d) { P.onWake = (P.onWake + d + kReactions) % kReactions; }),
+			item("Despues de bloquear", ReactionName(P.onBlock), "", [&](int d) { P.onBlock = (P.onBlock + d + kReactions) % kReactions; }),
 			item(P.rec == Practice::Recording ? "Parar la grabacion" : "Grabarlo (tu lo mueves)", "", "F5", [&](int) { P.ToggleRecord(); menuOpen = false; }),
 			item("Repetir la grabacion", P.tape.empty() ? "no hay" : yesNo(P.replay), "F6", [&](int) { if (!P.tape.empty()) P.replay = !P.replay; }),
 			item("Moverlo tu mismo", yesNo(P.controlRival), "F3", [&](int) { if (P.rec == Practice::NoRec) P.controlRival = !P.controlRival; }),
@@ -1590,6 +1641,7 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 			item("Cajas de golpe", yesNo(P.showBoxes), "", [&](int) { P.showBoxes = !P.showBoxes; }),
 			item("Cajas de empuje", yesNo(P.showPush), "", [&](int) { P.showPush = !P.showPush; }),
 			item("Medidor de frames", yesNo(P.showFrames), "F12", [&](int) { P.showFrames = !P.showFrames; }),
+			item("Contador de combos", yesNo(P.showCombo), "", [&](int) { P.showCombo = !P.showCombo; }),
 			Header("SALIR"),
 			item("Cambiar de personajes", "", "F10", [&](int) { P.ChangeCharacters(); menuOpen = false; }),
 			item("Salir de la practica", "", "Esc", [&](int) { quit = true; }),
@@ -1670,7 +1722,10 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 			if (P.phase == Practice::Fight && fightAt < 0) fightAt = t;
 			int k = fightAt < 0 ? -1 : t - fightAt;
 			if (k >= 0 && k < 80) in[0] = GUASA_RIGHT;
-			if (k >= 80 && k < 200 && k % 24 < 3) in[0] = k % 48 < 24 ? GUASA_DOWN | GUASA_MK : GUASA_HP;
+			if (k >= 80 && k < 140 && k % 24 < 3) in[0] = k % 48 < 24 ? GUASA_DOWN | GUASA_MK : GUASA_HP;
+			if (k >= 140 && k < 165) in[0] = GUASA_RIGHT;   // close again
+			if (k >= 165 && k < 174) in[0] = k < 168 ? GUASA_DOWN | GUASA_MK : k < 171 ? GUASA_DOWN | GUASA_RIGHT : GUASA_RIGHT | GUASA_HP;   // a combo
+			if (k == 222) { DrawPractice(P, NULL, 0, ""); SaveWindow(shots + "/practica-combo.bmp"); }   // once the life bar finished going down
 			if (k >= 200 && k < 215) in[0] = GUASA_DOWN | GUASA_RIGHT;
 			for (int g : { 108, 110, 112 }) if (k == g) { DrawPractice(P, NULL, 0, ""); SaveWindow(shots + "/practica-golpe-" + std::to_string(g) + ".bmp"); }
 			if (k == 230) { DrawPractice(P, NULL, 0, "Posicion guardada"); SaveWindow(shots + "/practica-pelea.bmp"); }
@@ -1716,6 +1771,7 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 	CloseAll();
 	return 0;
 }
+
 
 // practica-prueba: the practice mode's own checks, without a window. One line
 // per check (PASA / FALLA); exit code 0 only if all pass.
@@ -1850,6 +1906,49 @@ static int PracticeSelfTest(const char* roms)
 	P.stance = kStand;
 	check(guasa_read_ram(kClock) == 0x99, "el reloj se queda en 99");
 
+	// the combo counter: what it says after each of these (the player is Ryu)
+	auto combo = [&](int stance, const std::vector<std::pair<int, uint16_t>>& steps, bool close = true) {
+		P.LoadPosition();
+		P.stance = stance;
+		if (close) { run(100, GUASA_RIGHT); run(20, 0); }
+		P.combo.Reset();
+		P.combo.hits = P.combo.damage = 0;
+		for (auto [n, b] : steps) run(n, b);
+		run(150, 0);
+		const ComboCounter& c = P.combo;
+		return std::make_pair(c.hits, std::to_string(c.hits) + " golpes, " + std::to_string(c.damage) + " de dano" + (c.live ? ", sigue" : ""));
+	};
+	auto [h1, d1] = combo(kStand, { { 3, GUASA_HP } });
+	check(h1 == 1 && !P.combo.live, "combos: un golpe fuerte es 1 golpe, y termina", d1);
+	auto [h2, d2] = combo(kStand, { { 6, GUASA_DOWN }, { 3, GUASA_DOWN | GUASA_MK }, { 3, GUASA_DOWN | GUASA_RIGHT }, { 3, GUASA_RIGHT | GUASA_HP } });
+	check(h2 == 2 && P.combo.damage > 24, "combos: barrida media cancelada en hadoken, 2 golpes", d2);
+	int bestDamage = P.combo.damage;
+	auto [h3, d3] = combo(kStand, { { 4, GUASA_RIGHT | GUASA_HP } });
+	check(h3 == 1 && P.combo.damage > 0, "combos: el agarre cuenta como golpe", d3);
+	auto [h4, d4] = combo(kStand, { { 3, GUASA_HP }, { 90, 0 }, { 3, GUASA_HP } });
+	check(h4 == 1, "combos: dos golpes con tiempo entre medio no son combo", d4);
+	P.refillLife = false;
+	auto [h5, d5] = combo(kBlock, { { 3, GUASA_DOWN }, { 3, GUASA_DOWN | GUASA_RIGHT }, { 3, GUASA_RIGHT | GUASA_LP } }, false);
+	int chip = kFullLife - life2();
+	P.refillLife = true;
+	check(h5 == 0, "combos: un hadoken bloqueado no es golpe (aunque raspe vida)", d5 + ", raspo " + std::to_string(chip));
+	check(P.combo.bestHits == 2 && P.combo.bestDamage == bestDamage, "combos: el mejor combo se queda (el de mas dano)",
+	      std::to_string(P.combo.bestHits) + " golpes, " + std::to_string(P.combo.bestDamage) + " de dano");
+	// the rival hitting the player (moved by the player here) doesn't count
+	{
+		P.LoadPosition();
+		P.controlRival = true;
+		run(100, GUASA_LEFT);   // the rival walks up to the player
+		run(20, 0);
+		P.combo.Reset();
+		P.combo.hits = 0;
+		int least = kFullLife;
+		for (int k = 0; k < 3; k++) { run(3, GUASA_HP); for (int i = 0; i < 40; i++) { frame(0); least = SDL_min(least, (int)(int16_t)ReadWord(kP1 + kLife)); } }
+		P.controlRival = false;
+		check(least < kFullLife && P.combo.hits == 0, "combos: los golpes del rival al jugador no cuentan",
+		      "vida del jugador " + std::to_string(least) + ", golpes contados " + std::to_string(P.combo.hits));
+	}
+
 	// record the rival walking forward, then it repeats it from the same position
 	P.LoadPosition();
 	int start = x2();
@@ -1879,6 +1978,53 @@ static int PracticeSelfTest(const char* roms)
 	int rivalLeft = char2();
 	check(P.phase == Practice::Fight && rivalLeft != rivalRight, "el rival es el que elige el jugador, no el del cursor",
 	      "derecha " + std::to_string(rivalRight) + ", izquierda " + std::to_string(rivalLeft));
+
+	// reversals, Ryu against Ken: after the rival's last stunned frame (knocked
+	// down, or blocking), its move must start on the very next one
+	P.ChangeCharacters();
+	run(30, 0); run(4, GUASA_LP); run(30, 0);
+	pickRival(0);
+	check(char2() == 4, "reversal: el rival es Ken", std::to_string(char2()));
+	auto watch = [&](const std::vector<std::pair<int, uint16_t>>& attack, int stance) {
+		P.LoadPosition();
+		P.stance = stance;
+		run(100, GUASA_RIGHT); run(20, 0);
+		for (auto [n, b] : attack) run(n, b);
+		int last = -1, move = -1, what = 0;
+		for (int i = 0; i < 200 && move < 0; i++) {
+			frame(0);
+			uint8_t st = guasa_read_ram(kP2 + 3);
+			if (st == 0x0E || st == 0x14) last = i;
+			else if (last >= 0 && (st == 0x0A || st == 0x0C || st == 0x04)) { move = i; what = st; }
+		}
+		return std::make_pair(move < 0 ? -1 : move - last, what);
+	};
+	auto said = [](std::pair<int, int> r) {
+		return r.first < 0 ? std::string("no hizo nada") : "a los " + std::to_string(r.first) + " cuadros, estado " + std::to_string(r.second);
+	};
+	const std::vector<std::pair<int, uint16_t>> sweep = { { 4, GUASA_DOWN | GUASA_HK } }, heavy = { { 3, GUASA_HP } };
+	P.onWake = kReactHeavy;
+	auto r1 = watch(sweep, kStand);
+	check(r1.first == 1 && r1.second == 0x0A, "reversal: al levantarse, golpe fuerte en el primer cuadro libre", said(r1));
+	P.onWake = kReactJumpBack;
+	auto r2 = watch(sweep, kStand);
+	check(r2.first == 1 && r2.second == 0x04, "reversal: al levantarse, salta atras en el primer cuadro libre", said(r2));
+	// a shoryuken recorded by the player (Ken on the right: forward is left)
+	P.LoadPosition();
+	P.ToggleRecord();
+	run(10, 0); run(1, GUASA_LEFT); run(1, GUASA_DOWN); run(2, GUASA_DOWN | GUASA_LEFT | GUASA_HP); run(40, 0);
+	P.ToggleRecord();
+	P.replay = false;
+	P.onWake = kReactTape;
+	auto r3 = watch(sweep, kStand);
+	check(r3.first == 1 && r3.second == 0x0C, "reversal: al levantarse, el shoryuken grabado sale en el primer cuadro libre", said(r3));
+	P.onWake = kReactNothing;
+	P.onBlock = kReactTape;
+	auto r4 = watch(heavy, kBlock);
+	check(r4.first == 1 && r4.second == 0x0C, "reversal: despues de bloquear, el shoryuken grabado sale en el primer cuadro libre", said(r4));
+	P.onBlock = kReactNothing;
+	auto r5 = watch(sweep, kStand);
+	check(r5.first < 0, "reversal: en «nada», el rival no hace nada", said(r5));
 	guasa_exit();
 	return fails ? 1 : 0;
 }

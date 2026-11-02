@@ -10,7 +10,11 @@
 // - one saved position to go back to, in memory only (never a file: players
 //   don't get savestates);
 // - the player's buttons can arrive a few frames late, like online;
-// - a history of the buttons with how many frames each one lasted.
+// - a history of the buttons with how many frames each one lasted;
+// - a combo counter: the hits in a row the player lands and the damage they did,
+//   and the best combo of the fight;
+// - reversals: what the rival does on its first free frame after getting up, or
+//   after blocking (the recording, a jump back...).
 #pragma once
 #include <stdint.h>
 #include <deque>
@@ -36,6 +40,14 @@ constexpr uint8_t kOwnStageBase = 0x0B;
 
 enum Stance { kStand, kCrouch, kJump, kBlock, kBlockLow, kBlockAfterHit, kStances };
 const char* StanceName(int s);
+
+// What the rival does on getting up or after blocking, on its first free frame
+// (a reversal). The game takes a special move's button up to 2 frames before
+// the rival can act and does it on its first free frame; when that frame comes
+// is found by playing the next frames ahead from a copy of the state in memory
+// (about 25 ms for a knockdown), then going back.
+enum Reaction { kReactNothing, kReactTape, kReactJumpBack, kReactSweep, kReactHeavy, kReactions };
+const char* ReactionName(int r);
 
 struct HistoryEntry { uint16_t in; int frames; };
 
@@ -78,6 +90,24 @@ private:
 	uint8_t m_state[2] = {}, m_sub[2] = {}, m_stop[2] = {};   // last frame's
 };
 
+// The combo counter: the hits player 1 lands in a row on the rival, and the
+// damage they did. Only player 1's: the rival's (moved by the player, a second
+// control or a recording) don't count. A hit is the rival's life going down while
+// hit, knocked down or thrown (chip damage on a block isn't one); the combo goes
+// on while the rival never gets free in between (+0x03 hit stun 0E or thrown 14,
+// or held by a throw).
+class ComboCounter {
+public:
+	int hits = 0, damage = 0;           // the combo going on, or the last one
+	bool live = false;                  // it's still going
+	int shownFor = 0;                   // frames left to show a finished one
+	int bestHits = 0, bestDamage = 0;   // the best since the fight began: the most damage (then the most hits)
+	void Update();                      // after every frame of the fight, before life is refilled
+	void Reset();                       // after loading a position or a new fight
+private:
+	int m_life = kFullLife;             // the rival's life last frame
+};
+
 class Practice {
 public:
 	// Characters are picked first: the player's, then the rival's with the same control.
@@ -99,6 +129,9 @@ public:
 	// The boxes of the picture on screen now (it's 2 frames behind the game's RAM).
 	const std::vector<Box>& ShownBoxes() const { return m_boxes.front(); }
 	FrameMeter meter;
+	ComboCounter combo;
+	bool showCombo = true;          // the combo counter
+	int onWake = kReactNothing, onBlock = kReactNothing;   // the rival's reversal on getting up, and after blocking
 	std::vector<uint16_t> tape;     // the rival's recorded buttons
 	size_t tapePos = 0;
 	std::deque<HistoryEntry> history[2];
@@ -133,6 +166,14 @@ private:
 	int m_blockFor = 0;
 	bool m_tapeOnRight = true;
 	uint8_t m_lastClock = 0;
+	// the reversal on its way: its buttons, played from frame m_seqStart on (frames counted by m_seqFrame)
+	enum Moment { kNone, kDownNow, kBlockingNow };
+	Moment RivalMoment() const;
+	void PlanReversal(int what);
+	std::vector<uint16_t> m_seq;
+	int m_seqStart = 0, m_seqFrame = 0;
+	Moment m_moment = kNone;
+	uint8_t m_stop2 = 0;            // the rival's hitstop counter last frame
 };
 
 uint16_t ReadWord(uint32_t a);
