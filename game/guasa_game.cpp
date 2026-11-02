@@ -13,6 +13,10 @@
 //   guasa-game practica-prueba <roms>   checks practice mode without a window
 //   guasa-game repeticion <roms> <file> [j1=<rank|->:<name>] [j2=...]   watches a replay
 //   guasa-game repeticion-prueba <roms> <file>   plays it without a window, prints the final state
+//   guasa-game espectar <roms> [pausa] [j1=...] [j2=...]   watches a set live: the frames
+//                                come on stdin ("cuadros <from> <base64>", "fin")
+// Online, "transmitir" prints the confirmed frames for spectators ("cuadros <from> <base64>"),
+// and "espectadores <n>" on stdin says how many are watching.
 // Online, "grabar=<file>" saves the set's replay when the window closes.
 //
 // In the window: F1 sets up a control, F11 or Alt+Enter = full screen.
@@ -482,6 +486,7 @@ static void CloseAll()
 
 // Voice chat, as the interface reports it ("voz estado ..."): -1 no voice in this set.
 static std::atomic<int> g_voiceMic{ -1 }, g_voiceRival{ -1 };
+static std::atomic<int> g_watchers{ 0 };   // spectators of this set ("espectadores <n>")
 
 // Top line in online matches, like Fightcade's: ping, jitter, delay and rollback.
 static void DrawStats(const NetStats& st, int local)
@@ -489,10 +494,12 @@ static void DrawStats(const NetStats& st, int local)
 	SDL_FRect r = GameRect();
 	float s = r.h / 450 > 1 ? r.h / 450 : 1;
 	char line[200];
-	snprintf(line, sizeof(line), "P%d   ping %u ms   jitter %.0f ms   delay %d   rollback %d (max %d)%s%s",
+	char watching[32] = "";
+	if (g_watchers > 0) snprintf(watching, sizeof(watching), "   espectadores %d", (int)g_watchers);
+	snprintf(line, sizeof(line), "P%d   ping %u ms   jitter %.0f ms   delay %d   rollback %d (max %d)%s%s%s",
 	         local + 1, st.ping, st.jitter, st.delay, st.lastRollback, st.maxRollback,
 	         g_voiceMic < 0 ? "" : g_voiceMic ? "   F7 mic: si" : "   F7 mic: NO",
-	         g_voiceRival < 0 ? "" : g_voiceRival ? "  F8 rival: se oye" : "  F8 rival: SILENCIADO");
+	         g_voiceRival < 0 ? "" : g_voiceRival ? "  F8 rival: se oye" : "  F8 rival: SILENCIADO", watching);
 	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
 	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 150);
 	SDL_FRect box{ r.x, r.y, r.w, 14 * s };
@@ -723,7 +730,7 @@ static void SaveWindow(const std::string& path);
 
 // shots: "captura=<folder>" (checking the screen without hands): once playing, a
 // message arrives, then the panel opens, then the pause; a picture of each.
-static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string& shots = "", const std::string& recordTo = "")
+static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string& shots = "", const std::string& recordTo = "", bool stream = false)
 {
 	char msg[300] = "";
 	if (guasa_init(roms, msg, sizeof(msg))) {
@@ -773,6 +780,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 				std::lock_guard<std::mutex> lock(inboxLock);
 				if (tab != std::string::npos) inbox.push_back({ line.substr(8, tab - 8), line.substr(tab + 1), 0, 0 });
 			}
+			if (line.rfind("espectadores ", 0) == 0) g_watchers = atoi(line.c_str() + 13);
 			if (line.rfind("voz estado", 0) == 0) {
 				auto val = [&](const char* key) {
 					size_t at = line.find(key);
@@ -793,6 +801,17 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 	int shownDelay = -1;
 	MessagePanel panel;
 	NetMatch::Status st0 = NetMatch::Waiting;   // last frame's
+	size_t streamed = 0;         // frames already sent to the spectators
+	// the spectators' frames: those no rollback can change anymore (GekkoNet
+	// predicts at most 8 ahead), every half second; all of them at the end
+	auto streamFrames = [&](bool all) {
+		const std::vector<uint32_t>& rec = net.Recorded();
+		size_t upto = all ? rec.size() : rec.size() > 12 ? rec.size() - 12 : 0;
+		if (!stream || upto <= streamed || (!all && upto - streamed < 30)) return;
+		printf("cuadros %zu %s\n", streamed, FramesToBase64(rec.data() + streamed, upto - streamed).c_str());
+		fflush(stdout);
+		streamed = upto;
+	};
 	std::deque<ShownMessage> shownMsgs;
 	std::string note;            // a short notice in the middle (the pause only in casual...)
 	Uint64 noteAt = 0;
@@ -940,6 +959,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 		bool shown = false;
 		NetMatch::Status st = net.Step(local, true, &shown);
 		st0 = st;
+		streamFrames(false);
 		const NetStats& stats = net.Stats();
 		if (shown && net.Pause().phase == 0) {   // paused: no sound (it would repeat)
 			PushAudio();
@@ -989,6 +1009,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 		if (next > now) SDL_DelayPrecise(next - now);
 		else if (now - next > 5 * frameNs) next = now;
 	}
+	streamFrames(true);
 	const NetStats& s = net.Stats();
 	if (!recordTo.empty() && s.started) {   // the set's replay (the app sends it to the hub)
 		Replay rep = net.Recording();
@@ -1694,6 +1715,129 @@ static int PlayReplay(const char* roms, const char* file, const std::string& sho
 	return 0;
 }
 
+// espectar: a set as it's played. The frames come on stdin from the app (which
+// gets them from the hub, sent by player 1's game); the game here runs them about
+// two seconds behind. Joining late, it catches up fast without drawing. Keeps the
+// score by counting the games each one wins.
+static int Spectate(const char* roms, bool pause, const std::string& shots = "")
+{
+	char msg[300] = "";
+	if (guasa_init(roms, msg, sizeof(msg))) {
+		char report[4000] = "";
+		guasa_check_rom(roms, report, sizeof(report));
+		printf("error: %s\n%s", msg, report);
+		return 1;
+	}
+	guasa_boot_to_select();
+	if (!OpenWindow("La Guasabara - Espectar")) return 1;
+	LoadMaps();
+	printf("espectando\n");
+	fflush(stdout);
+
+	static std::mutex lock;
+	static Replay live;              // the frames so far
+	static std::atomic<bool> over{ false }, leaveNow{ false };   // leaveNow: "salir" (the app stops watching)
+	live.pause = pause;
+	std::thread([] {
+		std::string line;
+		while (std::getline(std::cin, line)) {
+			if (line.rfind("salir", 0) == 0) { leaveNow = true; return; }
+			if (line.rfind("fin", 0) == 0) { over = true; continue; }
+			if (line.rfind("cuadros ", 0) != 0) continue;
+			size_t sp = line.find(' ', 8);
+			if (sp == std::string::npos) continue;
+			size_t from = strtoull(line.c_str() + 8, NULL, 10);
+			std::vector<uint32_t> got;
+			if (!FramesFromBase64(line.substr(sp + 1), got)) continue;
+			std::lock_guard<std::mutex> l(lock);
+			if (from == live.frames.size()) live.frames.insert(live.frames.end(), got.begin(), got.end());
+		}
+		over = true;   // the app closed
+	}).detach();
+
+	const size_t kBehind = (size_t)(2 * guasa_fps());   // about two seconds behind the players
+	size_t i = 0;
+	PauseState ps;
+	ResultWatcher results;
+	int score[2] = { 0, 0 };
+	bool quit = false, showInputs = false;
+	Uint64 endedAt = 0;
+	const Uint64 frameNs = (Uint64)(1e9 / guasa_fps());
+	Uint64 next = SDL_GetTicksNS();
+	auto step = [&](bool draw) {
+		Replay r;
+		{ std::lock_guard<std::mutex> l(lock); r.pause = live.pause; r.frames.assign(1, live.frames[i]); }
+		bool moved = ReplayFrame(r, 0, ps, draw);
+		i++;
+		if (int w = results.Update()) score[w - 1]++;
+		return moved;
+	};
+	while (!quit) {
+		SDL_Event ev;
+		while (SDL_PollEvent(&ev)) {
+			if (CaptureEvent(ev)) continue;
+			if (ev.type == SDL_EVENT_QUIT) quit = true;
+			if (ev.type == SDL_EVENT_KEY_DOWN) {
+				if (ev.key.scancode == SDL_SCANCODE_ESCAPE) quit = true;
+				if (ev.key.scancode == SDL_SCANCODE_F2) showInputs = !showInputs;
+				if (ev.key.scancode == SDL_SCANCODE_F11 || (ev.key.scancode == SDL_SCANCODE_RETURN && (ev.key.mod & SDL_KMOD_ALT)))
+					SDL_SetWindowFullscreen(g_win, !(SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN));
+			}
+		}
+		if (leaveNow) quit = true;
+		size_t have;
+		{ std::lock_guard<std::mutex> l(lock); have = live.frames.size(); }
+		bool ended = over;
+		size_t target = ended ? have : have > kBehind ? have - kBehind : 0;
+		bool catching = target > i + 300;   // far behind (joined late): fast, without drawing
+		if (catching) {
+			for (int k = 0; k < 600 && i + 1 < target; k++) step(false);
+			step(true);
+		} else if (i < target) {
+			bool moved = step(true);
+			if (i + 60 < target) step(true);   // a bit behind: a little faster
+			else if (moved) PushAudio();
+		}
+		std::string banner;
+		if (have == 0) banner = "ESPECTAR\nEsperando los primeros cuadros del set...";
+		else if (catching) banner = "ALCANZANDO EL SET\nUn momento: se pone al dia sin dibujar";
+		else if (ended && i >= have) {
+			if (!endedAt) endedAt = SDL_GetTicksNS();
+			banner = "FIN DEL SET\nEsc: salir";
+			if (SDL_GetTicksNS() - endedAt > 8000000000ULL) quit = true;
+		}
+		uint16_t raw[2] = { 0, 0 };
+		if (i > 0) { std::lock_guard<std::mutex> l(lock); raw[0] = (uint16_t)(live.frames[i - 1] & ~kPauseBit); raw[1] = (uint16_t)((live.frames[i - 1] >> 16) & ~kPauseBit); }
+		g_overlay = [&](const SDL_FRect& r) {
+			DrawNames(r);
+			float s = r.h / 450 > 1 ? r.h / 450 : 1;
+			char line[160];
+			snprintf(line, sizeof(line), "EN VIVO   %d - %d   %s   F2 botones   Esc dejar de ver", score[0], score[1], Clock(i).c_str());
+			SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+			SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 150);
+			SDL_FRect bar{ r.x, r.y, r.w, 14 * s };
+			SDL_RenderFillRect(g_ren, &bar);
+			Text(r.x + 6 * s, r.y + 3 * s, s, line, 220, 220, 220);
+			SDL_SetRenderDrawColor(g_ren, 230, 40, 60, 255);
+			SDL_FRect dot{ r.x + r.w - 16 * s, r.y + 3 * s, 8 * s, 8 * s };
+			if ((SDL_GetTicks() / 600) % 2 && !ended) SDL_RenderFillRect(g_ren, &dot);
+			if (ps.phase) Text(r.x + r.w - 150 * s, r.y + 3 * s, s, "(set en pausa)", 255, 220, 120);
+		};
+		Present(showInputs ? raw : NULL, banner.empty() ? NULL : banner.c_str());
+		static bool shot = false;   // captura=<folder>: one picture once it plays live
+		if (!shots.empty() && !shot && i > 900 && !catching) { SaveWindow(shots + "/espectar.bmp"); shot = true; }
+		next += frameNs;
+		Uint64 now = SDL_GetTicksNS();
+		if (next > now) SDL_DelayPrecise(next - now);
+		else if (now - next > 5 * frameNs) next = now;
+	}
+	printf("espectado: %zu cuadros, estado final %016llx\n", i, (unsigned long long)guasa_state_hash());
+	fflush(stdout);
+	g_overlay = nullptr;
+	CloseAll();
+	return 0;
+}
+
 int main(int argc, char** argv)
 {
 #ifdef _WIN32
@@ -1726,6 +1870,22 @@ int main(int argc, char** argv)
 	if (mode == "versus" || mode == "test") return Play(argv[2], mode == "test");
 	if (mode == "practica") return PlayPractice(argv[2], argc > 3 && strncmp(argv[3], "captura=", 8) == 0 ? argv[3] + 8 : "");
 	if (mode == "practica-prueba") return PracticeSelfTest(argv[2]);
+	if (mode == "espectar") {
+		bool pause = false;
+		std::string shots;
+		for (int i = 3; i < argc; i++) {
+			if (!strcmp(argv[i], "pausa")) pause = true;
+			if (!strncmp(argv[i], "captura=", 8)) shots = argv[i] + 8;
+			if ((!strncmp(argv[i], "j1=", 3) || !strncmp(argv[i], "j2=", 3)) && strchr(argv[i], ':')) {
+				int p = argv[i][1] - '1';
+				const char* colon = strchr(argv[i], ':');
+				std::string rank(argv[i] + 3, (size_t)(colon - (argv[i] + 3)));
+				g_ranks[p] = rank == "-" ? "" : rank;
+				g_names[p] = colon + 1;
+			}
+		}
+		return Spectate(argv[2], pause, shots);
+	}
 	if (mode == "repeticion" || mode == "repeticion-prueba") {
 		if (argc < 4) { fprintf(stderr, "uso: guasa-game %s <carpeta de ROMs> <archivo>\n", mode.c_str()); return 2; }
 		for (int i = 4; i < argc; i++)   // j1=<rank|->:<name>, j2=...: the names on top
@@ -1747,15 +1907,17 @@ int main(int argc, char** argv)
 			cfg.port = atoi(argv[4]);
 		}
 		std::string shots, recordTo;
+		bool stream = false;
 		for (int i = 5; i < argc; i++)
 			if (!strncmp(argv[i], "captura=", 8)) shots = argv[i] + 8;
 			else if (!strncmp(argv[i], "grabar=", 7)) recordTo = argv[i] + 7;
+			else if (!strcmp(argv[i], "transmitir")) stream = true;
 			else if (!ParseNetArg(argv[i], cfg)) { fprintf(stderr, "opción desconocida: %s\n", argv[i]); return 2; }
 		if (argc < 6 || cfg.local < 0 || cfg.local > 1 || (cfg.remote.empty() && (cfg.relay.empty() || cfg.token.size() != 16))) {
 			fprintf(stderr, "uso: guasa-game online <carpeta de ROMs> <1|2> <puerto_local> (<ip:puerto> | relay=<host:puerto> token=<32 hex> [relayonly]) [delay=N|auto] [lag=MS] [jitter=MS] [loss=PCT]\n");
 			return 2;
 		}
-		return PlayOnline(argv[2], cfg, shots, recordTo);
+		return PlayOnline(argv[2], cfg, shots, recordTo, stream);
 	}
 	fprintf(stderr, "modo desconocido: %s\n", mode.c_str());
 	return 2;

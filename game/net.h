@@ -60,6 +60,9 @@ bool SaveReplay(const std::string& path, const Replay& r);
 // True if the game moved.
 bool ReplayFrame(const Replay& rep, size_t i, PauseState& ps, bool draw);
 bool LoadReplay(const std::string& path, Replay& r, std::string* error);
+// Frames as text, to send them live to spectators: little-endian u32 each, in base64.
+std::string FramesToBase64(const uint32_t* frames, size_t n);
+bool FramesFromBase64(const std::string& text, std::vector<uint32_t>& out);
 
 class NetMatch {
 public:
@@ -93,6 +96,7 @@ public:
 	// The set so far as a replay: the buttons the game used on each frame (a
 	// rollback rewrites the frames it redoes, so they end up as they were played).
 	Replay Recording() const;
+	const std::vector<uint32_t>& Recorded() const { return m_record; }
 
 private:
 	struct GekkoSession* m_session = nullptr;

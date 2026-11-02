@@ -239,6 +239,41 @@ bool ReplayFrame(const Replay& rep, size_t i, PauseState& ps, bool draw)
 	return true;
 }
 
+static const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string FramesToBase64(const uint32_t* frames, size_t n)
+{
+	std::vector<uint8_t> b;
+	for (size_t i = 0; i < n; i++) for (int k = 0; k < 4; k++) b.push_back((uint8_t)(frames[i] >> (8 * k)));
+	std::string out;
+	for (size_t i = 0; i < b.size(); i += 3) {
+		uint32_t v = b[i] << 16 | (i + 1 < b.size() ? b[i + 1] << 8 : 0) | (i + 2 < b.size() ? b[i + 2] : 0);
+		out += kB64[v >> 18 & 63];
+		out += kB64[v >> 12 & 63];
+		out += i + 1 < b.size() ? kB64[v >> 6 & 63] : '=';
+		out += i + 2 < b.size() ? kB64[v & 63] : '=';
+	}
+	return out;
+}
+
+bool FramesFromBase64(const std::string& text, std::vector<uint32_t>& out)
+{
+	std::vector<uint8_t> b;
+	uint32_t v = 0;
+	int bits = 0;
+	for (char c : text) {
+		if (c == '=') break;
+		const char* p = strchr(kB64, c);
+		if (!p || !c) return false;
+		v = v << 6 | (uint32_t)(p - kB64);
+		bits += 6;
+		if (bits >= 8) { bits -= 8; b.push_back((uint8_t)(v >> bits)); }
+	}
+	if (b.size() % 4) return false;
+	for (size_t i = 0; i < b.size(); i += 4) out.push_back(b[i] | b[i + 1] << 8 | b[i + 2] << 16 | (uint32_t)b[i + 3] << 24);
+	return true;
+}
+
 static void Put16(std::vector<uint8_t>& b, uint16_t v) { b.push_back((uint8_t)v); b.push_back((uint8_t)(v >> 8)); }
 
 bool SaveReplay(const std::string& path, const Replay& r)
