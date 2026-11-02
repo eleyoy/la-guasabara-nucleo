@@ -78,6 +78,14 @@ uint8_t guasa_read_mem(uint32_t address);
  * sprites always). Only the picture changes, never the game: practice mode's
  * own stage hides the game's. Default: all (0xFF). */
 void guasa_set_layers(uint8_t mask);
+/* The cabinet's own buttons, from the next frame on: "Diagnostic" (its service
+ * menu) and "Service" (a credit). Only the offline Arcade mode: never online. */
+void guasa_cabinet(int diagnostic, int service);
+/* The machine's settings memory (EEPROM: what its service menu changes), so the
+ * Arcade mode keeps them like a real cabinet. Not a savestate. save: its size, or
+ * 0 if it doesn't fit; load: 0 if it went in. */
+size_t guasa_nvram_save(uint8_t* buf, size_t cap);
+int guasa_nvram_load(const uint8_t* buf, size_t len);
 
 /* The last drawn frame: RGB565, width x height, pitch in bytes. */
 const uint16_t* guasa_framebuffer(int* width, int* height, int* pitch);

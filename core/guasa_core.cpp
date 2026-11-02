@@ -308,6 +308,9 @@ static std::vector<INT16> g_audio;
 static std::vector<UINT8> g_frame;
 static INT32 g_w, g_h;
 static UINT8* g_pad[2][12];
+static UINT8* g_diag;      // the cabinet's "Diagnostic" (its service menu) and "Service" (a credit)
+static UINT8* g_service;
+static int g_cabDiag, g_cabService;
 static size_t g_stateSize;
 
 static const char* kPadNames[12] = { "Up", "Down", "Left", "Right", "Weak Punch", "Medium Punch",
@@ -323,6 +326,15 @@ static void FindPads()
 				snprintf(name, sizeof(name), "P%d %s", p + 1, kPadNames[k]);
 				if (bii.szName && strcmp(bii.szName, name) == 0) g_pad[p][k] = bii.pVal;
 			}
+}
+
+static void FindCabinet()
+{
+	BurnInputInfo bii;
+	for (UINT32 i = 0; BurnDrvGetInputInfo(&bii, i) == 0; i++) {
+		if (bii.szName && strcmp(bii.szName, "Diagnostic") == 0) g_diag = bii.pVal;
+		if (bii.szName && strcmp(bii.szName, "Service") == 0) g_service = bii.pVal;
+	}
 }
 
 // The league's SOCD rule: left + right = neutral, up + down = up (Fightcade's
@@ -386,6 +398,7 @@ int guasa_init(const char* rom_dir, char* message, size_t message_len)
 	g_frame.assign(g_w * g_h * 2, 0);
 	nBurnPitch = g_w * 2;
 	FindPads();
+	FindCabinet();
 	g_stateSize = Snapshot().size();
 	g_ready = true;
 	return 0;
@@ -476,8 +489,43 @@ void guasa_run_frame(const uint16_t inputs[2], int draw)
 		for (int k = 0; k < 12; k++)
 			if (g_pad[p][k]) *g_pad[p][k] = (v >> k) & 1;
 	}
+	if (g_diag) *g_diag = (UINT8)g_cabDiag;
+	if (g_service) *g_service = (UINT8)g_cabService;
 	pBurnDraw = draw ? g_frame.data() : NULL;
 	BurnDrvFrame();
+}
+
+void guasa_cabinet(int diagnostic, int service)
+{
+	g_cabDiag = diagnostic != 0;
+	g_cabService = service != 0;
+}
+
+// Fightcade's FBNeo left the EEPROM out of the driver's scan (and never writes it
+// to a file, so every machine starts the same); it is read here straight.
+void EEPROMScanData(INT32 nAction, INT32* pnMin);
+
+size_t guasa_nvram_save(uint8_t* buf, size_t cap)
+{
+	g_state.clear();
+	BurnAcb = AcbSave;
+	EEPROMScanData(ACB_NVRAM | ACB_READ, NULL);
+	if (g_state.empty() || g_state.size() > cap) return 0;
+	memcpy(buf, g_state.data(), g_state.size());
+	return g_state.size();
+}
+
+int guasa_nvram_load(const uint8_t* buf, size_t len)
+{
+	g_state.clear();
+	BurnAcb = AcbSave;
+	EEPROMScanData(ACB_NVRAM | ACB_READ, NULL);   // only to learn its size
+	if (g_state.empty() || len != g_state.size()) return 1;
+	g_loadSrc = (UINT8*)buf;
+	g_statePos = 0;
+	BurnAcb = AcbLoad;
+	EEPROMScanData(ACB_NVRAM | ACB_WRITE, NULL);
+	return 0;
 }
 
 size_t guasa_state_size(void) { return g_stateSize; }

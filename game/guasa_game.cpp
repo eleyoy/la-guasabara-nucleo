@@ -2,7 +2,10 @@
 // open it for each match and talk to it over stdio; for now it also runs alone:
 //
 //   guasa-game check <roms>      checks the ROM folder, one line per problem
-//   guasa-game versus <roms>     two players on this PC
+//   guasa-game versus <roms> [captura=<dir>]  two players on this PC: after each match both
+//                                pick again, with a win counter (nothing is recorded)
+//   guasa-game arcade <roms> [captura=<dir>]  the machine as it is, from power-on: coins, the
+//                                cabinet's service menu (F2) and service credit (9); no savestates
 //   guasa-game test <roms>       Test Game: versus plus both players' buttons on screen,
 //                                as pressed and as the game reads them (SOCD rule)
 //   guasa-game online <roms> <1|2> <local_port> (<ip:port> | relay=<host:port> token=<hex> [relayonly]) [delay=N|auto] [lag=MS] [jitter=MS] [loss=PCT]
@@ -311,7 +314,8 @@ static void DrawStats(const NetStats& st, int local);
 
 static std::function<void(const SDL_FRect&)> g_overlay;   // drawn last (messages in online sets)
 
-static void Present(const uint16_t* raw, const char* banner, const NetStats* stats = NULL, int local = 0)
+// show = false: drawn but not shown yet (a picture of it is taken first)
+static void Present(const uint16_t* raw, const char* banner, const NetStats* stats = NULL, int local = 0, bool show = true)
 {
 	SDL_UpdateTexture(g_tex, NULL, guasa_framebuffer(NULL, NULL, NULL), g_w * 2);
 	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 255);
@@ -332,7 +336,7 @@ static void Present(const uint16_t* raw, const char* banner, const NetStats* sta
 		if (nl) Text(r.x + 12 * s, box.y + 50 * s, s, nl + 1);
 	}
 	if (g_overlay) g_overlay(r);
-	SDL_RenderPresent(g_ren);
+	if (show) SDL_RenderPresent(g_ren);
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +431,24 @@ static std::string CaptureBanner()
 
 static void CloseAll();
 
-static int Play(const char* roms, bool test)
+static void SaveWindow(const std::string& path);
+
+// Random presses like the bot's, for checking Versus without hands.
+static uint16_t RandomPad(int frame, uint64_t& rng)
+{
+	uint16_t in = 0;
+	for (int k = 0; k < 10; k++) {
+		rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+		if ((uint32_t)(rng >> 33) % 100 < 30) in |= 1 << k;
+	}
+	if (frame % 1200 < 6) in |= GUASA_START;
+	return in;
+}
+
+// shots: "captura=<folder>" (checking the screen without hands): both sides press
+// at random, as fast as it goes; a picture when the first match is won, when both
+// are back at character select and when the second is won; then it closes.
+static int Play(const char* roms, bool test, const std::string& shots = "")
 {
 	char msg[300] = "";
 	if (guasa_init(roms, msg, sizeof(msg))) {
@@ -443,6 +464,17 @@ static int Play(const char* roms, bool test)
 	if (!OpenWindow(test ? "La Guasabara - Test Game" : "La Guasabara - Versus local")) return 1;
 	LoadMaps();
 
+	// Versus: after each match both go back to character select (not only the
+	// loser, as the machine does), with a counter of matches won.
+	std::vector<uint8_t> select(guasa_state_size());
+	guasa_save(select.data(), select.size());
+	ResultWatcher results;
+	int wins[2] = { 0, 0 }, lastWinner = 0;
+	int backIn = 0;   // frames left to go back to character select (4 s after a match)
+	int frame = 0, shotAt = -1;
+	std::string shotName;
+	uint64_t rng[2] = { 1, 2 };
+
 	const Uint64 frameNs = (Uint64)(1e9 / guasa_fps());   // 59.63 frames per second
 	Uint64 next = SDL_GetTicksNS();
 	bool quit = false;
@@ -456,15 +488,66 @@ static int Play(const char* roms, bool test)
 			case SDL_EVENT_JOYSTICK_REMOVED: RemoveDevice(ev.jdevice.which); break;
 			case SDL_EVENT_KEY_DOWN:
 				if (ev.key.scancode == SDL_SCANCODE_F1) StartCapture();
+				if (ev.key.scancode == SDL_SCANCODE_ESCAPE && !test) quit = true;
 				if (ev.key.scancode == SDL_SCANCODE_F11 || (ev.key.scancode == SDL_SCANCODE_RETURN && (ev.key.mod & SDL_KMOD_ALT)))
 					SDL_SetWindowFullscreen(g_win, !(SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN));
 				break;
 			}
 		}
 		uint16_t in[2] = { 0, 0 };
-		if (!g_cap.active) ReadPlayers(in);   // while setting up a control the game gets nothing
+		if (!shots.empty()) { in[0] = RandomPad(frame, rng[0]); in[1] = RandomPad(frame, rng[1]); }
+		else if (!g_cap.active) ReadPlayers(in);   // while setting up a control the game gets nothing
 		guasa_run_frame(in, 1);
-		PushAudio();
+		frame++;
+		if (shots.empty()) PushAudio();
+		if (!test) {
+			if (int w = results.Update()) {
+				wins[w - 1]++;
+				lastWinner = w;
+				backIn = 240;
+				printf("gana el jugador %d (%d - %d)\n", w, wins[0], wins[1]);
+				fflush(stdout);
+				shotAt = frame + 60, shotName = wins[0] + wins[1] == 1 ? "versus-gana" : "versus-segunda";
+			}
+			if (backIn && --backIn == 0) {   // both pick again
+				guasa_load(select.data(), select.size());
+				results = ResultWatcher();
+				printf("los dos eligen\n");
+				fflush(stdout);
+				if (wins[0] + wins[1] == 1) shotAt = frame + 90, shotName = "versus-eligen";
+			}
+			g_overlay = [&](const SDL_FRect& r) {
+				// the counter at the bottom middle, between the super meters: nothing of the game there
+				float s = r.h / 450 > 1 ? r.h / 450 : 1;
+				char line[80];
+				snprintf(line, sizeof(line), "J1  %d - %d  J2", wins[0], wins[1]);
+				float w = (float)strlen(line) * 8 * s + 16 * s;
+				SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+				SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 160);
+				SDL_FRect bar{ r.x + r.w / 2 - w / 2, r.y + r.h - 16 * s, w, 14 * s };
+				SDL_RenderFillRect(g_ren, &bar);
+				Text(bar.x + 8 * s, bar.y + 3 * s, s, line, 235, 235, 235);
+				if (frame < 600) Text(r.x + 6 * s, r.y + r.h - 13 * s, s, "Esc: salir", 200, 200, 200);
+				if (backIn) {   // who won, until both go back to pick
+					char who[48];
+					snprintf(who, sizeof(who), "GANA EL JUGADOR %d", lastWinner);
+					SDL_FRect b{ r.x + r.w / 2 - 110 * s, r.y + r.h * 0.3f, 220 * s, 22 * s };
+					SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 200);
+					SDL_RenderFillRect(g_ren, &b);
+					Text(b.x + 34 * s, b.y + 7 * s, s, who, 255, 220, 120);
+				}
+			};
+		}
+		if (!shots.empty()) {   // as fast as it goes: drawn only for the pictures
+			if (frame == shotAt) {
+				Present(NULL, NULL, NULL, 0, false);
+				SaveWindow(shots + "/" + shotName + ".bmp");
+				SDL_RenderPresent(g_ren);
+				if (shotName == "versus-segunda") quit = true;
+			}
+			if (frame > 120000) { printf("no termino ninguna pelea\n"); quit = true; }
+			continue;
+		}
 		std::string banner = g_cap.active ? CaptureBanner() : "";
 		Present(test ? in : NULL, banner.empty() ? NULL : banner.c_str());
 
@@ -473,6 +556,100 @@ static int Play(const char* roms, bool test)
 		if (next > now) SDL_DelayPrecise(next - now);
 		else if (now - next > 5 * frameNs) next = now;   // far behind (window dragged, PC busy): don't rush to catch up
 	}
+	g_overlay = nullptr;
+	CloseAll();
+	return 0;
+}
+
+// Arcade: the machine as it is, from power-on (its warning, the attract, coins
+// and start), with the cabinet's buttons on the keyboard: F2 its service menu,
+// 9 a service credit. Two players like at the arcade: coins, the winner stays.
+// No savestates, no counter, nothing recorded. The service menu's settings are
+// kept like a real cabinet's (its EEPROM, arcade.nv), never a savestate.
+// shots: "captura=<folder>": the power-on with the keys, a coin and start, the
+// service menu (F2 held), out of it; a picture of each, then it closes.
+static int PlayArcade(const char* roms, const std::string& shots = "")
+{
+	char msg[300] = "";
+	if (guasa_init(roms, msg, sizeof(msg))) {
+		char report[4000] = "";
+		guasa_check_rom(roms, report, sizeof(report));
+		printf("error: %s\n%s", msg, report);
+		return 1;
+	}
+	std::string nvPath = PrefFile("arcade.nv");
+	if (FILE* f = fopen(nvPath.c_str(), "rb")) {   // the cabinet's settings from last time
+		std::vector<uint8_t> nv(65536);
+		size_t n = fread(nv.data(), 1, nv.size(), f);
+		fclose(f);
+		if (guasa_nvram_load(nv.data(), n)) printf("ajustes de la maquina: no sirven, quedan los de fabrica\n");
+	}
+	if (!OpenWindow("La Guasabara - Arcade")) return 1;
+	LoadMaps();
+	printf("arcade\n");
+	fflush(stdout);
+
+	const Uint64 frameNs = (Uint64)(1e9 / guasa_fps());
+	Uint64 next = SDL_GetTicksNS(), start = next;
+	int frame = 0;
+	bool quit = false;
+	while (!quit) {
+		SDL_Event ev;
+		while (SDL_PollEvent(&ev)) {
+			if (CaptureEvent(ev)) continue;
+			switch (ev.type) {
+			case SDL_EVENT_QUIT: quit = true; break;
+			case SDL_EVENT_JOYSTICK_ADDED: AddDevice(ev.jdevice.which); break;
+			case SDL_EVENT_JOYSTICK_REMOVED: RemoveDevice(ev.jdevice.which); break;
+			case SDL_EVENT_KEY_DOWN:
+				if (ev.key.scancode == SDL_SCANCODE_ESCAPE) quit = true;
+				if (ev.key.scancode == SDL_SCANCODE_F1) StartCapture();
+				if (ev.key.scancode == SDL_SCANCODE_F11 || (ev.key.scancode == SDL_SCANCODE_RETURN && (ev.key.mod & SDL_KMOD_ALT)))
+					SDL_SetWindowFullscreen(g_win, !(SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN));
+				break;
+			}
+		}
+		uint16_t in[2] = { 0, 0 };
+		const bool* keys = SDL_GetKeyboardState(NULL);
+		bool diag = !g_cap.active && keys[SDL_SCANCODE_F2], service = !g_cap.active && keys[SDL_SCANCODE_9];
+		if (!shots.empty()) {   // the script: a coin, start, then the service menu
+			in[0] = (frame >= 1500 && frame < 1506 ? GUASA_COIN : 0) | (frame >= 1600 && frame < 1606 ? GUASA_START : 0);
+			diag = frame >= 2200 && frame < 2210;
+		} else if (!g_cap.active) ReadPlayers(in);
+		guasa_cabinet(diag, service);
+		guasa_run_frame(in, 1);
+		frame++;
+		PushAudio();
+		bool hint = shots.empty() ? SDL_GetTicksNS() - start < 12000000000ULL : frame < 1000;   // the keys, for the first seconds
+		g_overlay = [&](const SDL_FRect& r) {
+			if (!hint) return;
+			float s = r.h / 450 > 1 ? r.h / 450 : 1;
+			SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+			SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 170);
+			SDL_FRect bar{ r.x, r.y + r.h - 14 * s, r.w, 14 * s };
+			SDL_RenderFillRect(g_ren, &bar);
+			Text(r.x + 6 * s, r.y + r.h - 11 * s, s, "MONEDA y START   F2 menu de servicio   9 credito   Esc salir", 220, 220, 220);
+		};
+		std::string banner = g_cap.active ? CaptureBanner() : "";
+		Present(NULL, banner.empty() ? NULL : banner.c_str(), NULL, 0, shots.empty());
+		if (!shots.empty()) {
+			for (auto [f, name] : { std::pair<int, const char*>{ 400, "arcade-encendido" }, { 1560, "arcade-moneda" },
+			                        { 1900, "arcade-start" }, { 2600, "arcade-servicio" } })
+				if (frame == f) SaveWindow(shots + "/" + name + ".bmp");
+			SDL_RenderPresent(g_ren);
+			if (frame == 2600) quit = true;
+			continue;
+		}
+
+		next += frameNs;
+		Uint64 now = SDL_GetTicksNS();
+		if (next > now) SDL_DelayPrecise(next - now);
+		else if (now - next > 5 * frameNs) next = now;
+	}
+	std::vector<uint8_t> nv(65536);   // the cabinet's settings, for next time
+	if (size_t n = guasa_nvram_save(nv.data(), nv.size()))
+		if (FILE* f = fopen(nvPath.c_str(), "wb")) { fwrite(nv.data(), 1, n, f); fclose(f); }
+	g_overlay = nullptr;
 	CloseAll();
 	return 0;
 }
@@ -2017,7 +2194,13 @@ int main(int argc, char** argv)
 		printf("%s", report);
 		return n == 0 ? 0 : 1;
 	}
-	if (mode == "versus" || mode == "test") return Play(argv[2], mode == "test");
+	if (mode == "versus" || mode == "test" || mode == "arcade") {
+		std::string shots;
+		for (int i = 3; i < argc; i++)
+			if (!strncmp(argv[i], "captura=", 8)) shots = argv[i] + 8;
+		if (mode == "arcade") return PlayArcade(argv[2], shots);
+		return Play(argv[2], mode == "test", shots);
+	}
 	if (mode == "practica") {
 		std::string shots;
 		int stage = 0x0C;   // Cammy's, unless the app says otherwise
