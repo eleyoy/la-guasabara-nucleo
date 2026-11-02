@@ -204,12 +204,16 @@ static uint16_t ReadDevice(const Device& d)
 }
 
 // Player 1: the keyboard and the first control; player 2: the second control.
-static void ReadPlayers(uint16_t in[2])
+// keyboard = false leaves the keyboard out (it's typing a message).
+static bool KeyIsButton(SDL_Scancode sc);
+
+static void ReadPlayers(uint16_t in[2], bool keyboard = true)
 {
 	auto k = g_maps.find("teclado");
 	const Mapping& keys = k != g_maps.end() ? k->second : KeyboardDefault();
 	in[0] = in[1] = 0;
-	for (int i = 0; i < kActions; i++) if (BindDown(NULL, keys.b[i])) in[0] |= 1 << i;
+	if (keyboard)
+		for (int i = 0; i < kActions; i++) if (BindDown(NULL, keys.b[i])) in[0] |= 1 << i;
 	for (size_t p = 0; p < g_devs.size() && p < 2; p++) in[p] |= ReadDevice(g_devs[p]);
 }
 
@@ -492,6 +496,16 @@ static void DrawStats(const NetStats& st, int local)
 	if (st.desyncs) Text(r.x + r.w - 150 * s, r.y + 3 * s, s, "DESINCRONIZADO", 255, 80, 80);
 }
 
+// Whether a key is one of player 1's buttons on the keyboard (then T and P don't
+// open messages or pause: F4 and F3 do).
+static bool KeyIsButton(SDL_Scancode sc)
+{
+	auto k = g_maps.find("teclado");
+	const Mapping& keys = k != g_maps.end() ? k->second : KeyboardDefault();
+	for (int i = 0; i < kActions; i++) if (keys.b[i].kind == 'k' && keys.b[i].index == (int)sc) return true;
+	return false;
+}
+
 // ---------------------------------------------------------------------------
 // Messages during the set: the league's emojis, quick phrases or a few words.
 
@@ -544,19 +558,21 @@ static std::string EmojiOf(const std::string& text)
 	return "";
 }
 
-struct ShownMessage { std::string from, text; Uint64 at; };
+struct ShownMessage { std::string from, text; Uint64 at; int side; };   // side: 0 player 1, 1 player 2
 
-// The last messages, top right, each for 6 seconds.
+// The last messages, each for 6 seconds, on the side of who wrote it: player 1's
+// on the left, player 2's on the right.
 static void DrawMessages(const SDL_FRect& r, std::deque<ShownMessage>& list)
 {
 	Uint64 now = SDL_GetTicksNS();
 	while (!list.empty() && now - list.front().at > 6000000000ULL) list.pop_front();
-	float s = r.h / 450 > 1 ? r.h / 450 : 1, y = r.y + 20 * s;
+	float s = r.h / 450 > 1 ? r.h / 450 : 1, ys[2] = { r.y + 20 * s, r.y + 20 * s };
 	for (auto& m : list) {
+		float& y = ys[m.side ? 1 : 0];
 		std::string id = EmojiOf(m.text), text = id.empty() ? Plain(m.text) : "";
 		float big = id.empty() ? 0 : 56 * s, w = SDL_max(Plain(m.from).size() * 8 * s, text.size() * 8 * s) + big + 16 * s;
 		float h = SDL_max(big, 22 * s) + 8 * s;
-		SDL_FRect box{ r.x + r.w - w - 8 * s, y, w, h };
+		SDL_FRect box{ m.side ? r.x + r.w - w - 8 * s : r.x + 8 * s, y, w, h };
 		SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
 		SDL_SetRenderDrawColor(g_ren, 10, 10, 18, 200);
 		SDL_RenderFillRect(g_ren, &box);
@@ -573,7 +589,7 @@ static void DrawMessages(const SDL_FRect& r, std::deque<ShownMessage>& list)
 
 // The panel to send one (T): 9 emojis, the quick phrases and a line to type.
 struct MessagePanel {
-	bool open = false;
+	bool open = false, justOpened = false;   // justOpened: the key that opened it isn't typed
 	int sel = 0;                 // 0-8 emojis, 9-13 phrases, 14 the line
 	std::string typed;
 	static constexpr int kCount = 9 + 5 + 1;
@@ -663,7 +679,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 			if (line.rfind("mensaje ", 0) == 0) {   // "mensaje <name>\t<text>"
 				size_t tab = line.find('\t', 8);
 				std::lock_guard<std::mutex> lock(inboxLock);
-				if (tab != std::string::npos) inbox.push_back({ line.substr(8, tab - 8), line.substr(tab + 1), 0 });
+				if (tab != std::string::npos) inbox.push_back({ line.substr(8, tab - 8), line.substr(tab + 1), 0, 0 });
 			}
 			if (line.rfind("voz estado", 0) == 0) {
 				auto val = [&](const char* key) {
@@ -693,6 +709,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 	uint16_t lastPad = 0;
 	auto openPanel = [&](bool open) {
 		panel.open = open;
+		panel.justOpened = open;
 		panel.typed.clear();
 		if (open) SDL_StartTextInput(g_win); else SDL_StopTextInput(g_win);
 	};
@@ -703,7 +720,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 		clean = clean.substr(0, 120);
 		printf("mensaje %s\n", clean.c_str());
 		fflush(stdout);
-		shownMsgs.push_back({ "Tu", clean, SDL_GetTicksNS() });
+		shownMsgs.push_back({ "Tu", clean, SDL_GetTicksNS(), cfg.local });
 		openPanel(false);
 	};
 	auto askPause = [&]() {
@@ -721,8 +738,8 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 			case SDL_EVENT_QUIT: quit = true; break;
 			case SDL_EVENT_JOYSTICK_ADDED: AddDevice(ev.jdevice.which); break;
 			case SDL_EVENT_JOYSTICK_REMOVED: RemoveDevice(ev.jdevice.which); break;
-				case SDL_EVENT_TEXT_INPUT:
-				if (panel.open && panel.typed.size() < 120) { panel.typed += ev.text.text; panel.sel = 14; }
+			case SDL_EVENT_TEXT_INPUT:
+				if (panel.open && !panel.justOpened && panel.typed.size() < 120) { panel.typed += ev.text.text; panel.sel = 14; }
 				break;
 			case SDL_EVENT_MOUSE_MOTION:
 			case SDL_EVENT_MOUSE_BUTTON_DOWN:
@@ -754,8 +771,11 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 				}
 				switch (ev.key.scancode) {
 				case SDL_SCANCODE_ESCAPE: quit = true; break;
-				case SDL_SCANCODE_T: openPanel(true); break;
-				case SDL_SCANCODE_P: case SDL_SCANCODE_PAUSE: askPause(); break;
+				// T and P, unless they are buttons of the game for this player; F4 and F3 always
+				case SDL_SCANCODE_T: if (!KeyIsButton(SDL_SCANCODE_T)) openPanel(true); break;
+				case SDL_SCANCODE_F4: openPanel(true); break;
+				case SDL_SCANCODE_P: if (!KeyIsButton(SDL_SCANCODE_P)) askPause(); break;
+				case SDL_SCANCODE_F3: case SDL_SCANCODE_PAUSE: askPause(); break;
 				case SDL_SCANCODE_F1: StartCapture(); break;
 				case SDL_SCANCODE_F2: showInputs = !showInputs; break;
 				case SDL_SCANCODE_F5: net.SetDelay(net.Stats().delay - 1); break;
@@ -770,14 +790,17 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 			}
 		}
 
+		panel.justOpened = false;
 		{
 			std::lock_guard<std::mutex> lock(inboxLock);
-			for (auto& m : inbox) shownMsgs.push_back({ m.from, m.text, SDL_GetTicksNS() });
+			for (auto& m : inbox) shownMsgs.push_back({ m.from, m.text, SDL_GetTicksNS(), 1 - cfg.local });   // the rival's side
 			inbox.clear();
 		}
-		while (shownMsgs.size() > 3) shownMsgs.pop_front();
+		while (shownMsgs.size() > 6) shownMsgs.pop_front();
 		uint16_t in[2] = { 0, 0 };
-		if (!g_cap.active) ReadPlayers(in);   // this side plays with player 1's controls
+		// this side plays with player 1's controls; while the message panel is open
+		// the keyboard only types (a key that is also a button mustn't send or close it)
+		if (!g_cap.active) ReadPlayers(in, !panel.open);
 		uint16_t pad = in[0], pressed = pad & ~lastPad;
 		lastPad = pad;
 		if (panel.open) {   // with the controller: directions move, a punch sends, a kick closes
@@ -795,7 +818,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 		if (!shots.empty() && st0 == NetMatch::Playing) {   // the script
 			static int t = 0;
 			t++;
-			if (t == 60) { std::lock_guard<std::mutex> lock(inboxLock); inbox.push_back({ "Rival", ":palomo:", 0 }); inbox.push_back({ "Rival", "Que tal, mi hermano? Una mas!", 0 }); }
+			if (t == 60) { std::lock_guard<std::mutex> lock(inboxLock); inbox.push_back({ "Rival", ":palomo:", 0, 0 }); inbox.push_back({ "Rival", "Que tal, mi hermano? Una mas!", 0, 0 }); shownMsgs.push_back({ "Tu", ":ggs:", SDL_GetTicksNS(), cfg.local }); }
 			if (t == 90) SaveWindow(shots + "/online-mensajes.bmp");
 			if (t == 100) { openPanel(true); panel.sel = 4; }
 			if (t == 110) SaveWindow(shots + "/online-panel.bmp");
