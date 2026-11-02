@@ -76,6 +76,99 @@ static bool CheckXxh64()
 	return ok;
 }
 
+// From character select: moves each cursor (L R U D per step), picks with LP,
+// and runs until the clock first ticks (99 -> 98). Returns the frames waited.
+static int PickAndFight(const std::string moves[2], int draw)
+{
+	uint16_t in[2] = { 0, 0 };
+	auto run = [&](int frames, uint16_t p1, uint16_t p2) { for (int f = 0; f < frames; f++) { in[0] = p1; in[1] = p2; guasa_run_frame(in, draw); } };
+	auto dir = [](const std::string& m, size_t k) -> uint16_t {
+		if (k >= m.size()) return 0;
+		char c = m[k];
+		return c == 'L' ? GUASA_LEFT : c == 'R' ? GUASA_RIGHT : c == 'U' ? GUASA_UP : c == 'D' ? GUASA_DOWN : 0;
+	};
+	run(30, 0, 0);
+	for (size_t k = 0; k < moves[0].size() || k < moves[1].size(); k++) { run(4, dir(moves[0], k), dir(moves[1], k)); run(8, 0, 0); }
+	run(4, GUASA_LP, GUASA_LP); run(30, 0, 0); run(4, GUASA_LP, GUASA_LP);
+	int f = 0;
+	for (; f < 4000 && guasa_read_ram(0xFF8DCE) != 0x99; f++) run(1, 0, 0);
+	for (; f < 8000 && guasa_read_ram(0xFF8DCE) != 0x98; f++) run(1, 0, 0);
+	return f;
+}
+
+// Hitbox viewer research (mode "boxes"). The recipe, after the mame-rr script
+// sf2-hitboxes.lua by Dammit / felineki (ssf2t profile, as kept in
+// github.com/peon2/fbneo-training-mode hitboxes/), checked against our frames:
+//   camera: screen_left = s16 FF8ED4, screen_top = s16 FF8ED8
+//   object: X = s16 +06, Y = s16 +0A, flip = u8 +12 (1 = facing left),
+//           anim frame = u32 +1A, box table = u32 +34 (ROM)
+//   screen: sx = X - screen_left, sy = 224 - (Y - 15) + screen_top (the feet)
+//   box kind k: id = u8 anim[k.id_at]; 0 = none; table = boxtab + s16 boxtab[k.tab];
+//           entry = table + id * k.size: s8 dx, s8 dy, u8 rx, u8 ry
+//           (attack: if u8 entry[5] >= 0x80, dx = -entry[5]);
+//           centre (sx + (flip ? -dx : dx), sy - dy), half sizes rx, ry
+struct HitBox { int obj; std::string type; int id, l, t, r, b; };
+
+static uint16_t MemW(uint32_t a) { return (uint16_t)(guasa_read_mem(a) << 8 | guasa_read_mem(a + 1)); }
+static uint32_t MemL(uint32_t a) { return (uint32_t)MemW(a) << 16 | MemW(a + 2); }
+
+static std::vector<HitBox> ComputeBoxes()
+{
+	struct Kind { int tab, idAt, size; const char* type; };
+	static const Kind kinds[] = {
+		{ 0x8, 0xD, 0x04, "push" },
+		{ 0x0, 0x8, 0x04, "hurt" },
+		{ 0x2, 0x9, 0x04, "hurt" },
+		{ 0x4, 0xA, 0x04, "hurt" },
+		{ 0x6, 0xC, 0x10, "attack" },
+	};
+	std::vector<HitBox> out;
+	int left = (int16_t)MemW(0xFF8ED4), top = (int16_t)MemW(0xFF8ED8);
+	auto object = [&](int obj, uint32_t base, bool proj) {
+		int sx = (int16_t)MemW(base + 0x06) - left;
+		int sy = 224 - ((int16_t)MemW(base + 0x0A) - 15) + top;
+		bool flip = guasa_read_mem(base + 0x12) == 1;
+		uint32_t anim = MemL(base + 0x1A), tab = MemL(base + 0x34);
+		out.push_back({ obj, "axis", 0, sx, sy, sx, sy });
+		for (auto& k : kinds) {
+			int id = guasa_read_mem(anim + k.idAt);
+			if (!id) continue;
+			std::string type = k.type;
+			if (proj) { if (type == "attack") type = "proj_attack"; else if (type == "push") type = "proj_hurt"; }
+			else if (type == "attack" && guasa_read_mem(base + 0x03) == 0) continue;
+			uint32_t e = tab + (int16_t)MemW(tab + k.tab) + id * k.size;
+			int dx = (int8_t)guasa_read_mem(e), dy = (int8_t)guasa_read_mem(e + 1);
+			int rx = guasa_read_mem(e + 2), ry = guasa_read_mem(e + 3);
+			if (type == "attack" && guasa_read_mem(e + 5) >= 0x80) dx = -guasa_read_mem(e + 5);
+			int cx = sx + (flip ? -dx : dx), cy = sy - dy;
+			out.push_back({ obj, type, id, cx - rx, cy - ry, cx + rx, cy + ry });
+		}
+		if (proj) return;
+		// throwable: +6C half width, +6E height, standing on the feet
+		int trx = MemW(base + 0x6C), try_ = MemW(base + 0x6E);
+		uint8_t st = guasa_read_mem(base + 0x03);
+		bool hurt = guasa_read_mem(anim + 8) || guasa_read_mem(anim + 9) || guasa_read_mem(anim + 0xA);
+		if (hurt && st != 0x0E && st != 0x14 && !guasa_read_mem(base + 0x143) && !guasa_read_mem(base + 0x1BF) && !guasa_read_mem(base + 0x1A1))
+			out.push_back({ obj, guasa_read_mem(base + 0x181) ? "air_throwable" : "throwable", 0, sx - trx, sy - try_, sx + trx, sy });
+		// throw: +64 s16 dx, +66 s16 dy, +68 rx, +6A ry (written by a throw attempt; stays there)
+		int tdx = (int16_t)MemW(base + 0x64), tdy = (int16_t)MemW(base + 0x66), tx = MemW(base + 0x68), ty = MemW(base + 0x6A);
+		if (tdx || tdy || tx || ty) {
+			int cx = sx + (flip ? -tdx : tdx), cy = sy - tdy;
+			out.push_back({ obj, "throw", 0, cx - tx, cy - ty, cx + tx, cy + ty });
+		}
+	};
+	for (int p = 0; p < 2; p++) {
+		uint32_t base = 0xFF844E + 0x400 * p;
+		if (guasa_read_mem(base) > 0) object(p, base, false);
+	}
+	for (int i = 0; i < 24; i++) {
+		uint32_t base = 0xFF97A2 + 0xC0 * i;
+		uint16_t w = MemW(base);
+		if (i < 8 ? w == 0x0101 : (w & 0xFF00) == 0x0100) object(10 + i, base, i < 8);
+	}
+	return out;
+}
+
 int main(int argc, char** argv)
 {
 	if (argc < 3) { fprintf(stderr, "usage: core_test <roms> check|select|hashes|rollback|state [arg]\n"); return 2; }
@@ -190,18 +283,7 @@ int main(int argc, char** argv)
 			if (argv[i][0] == 'p' && (argv[i][1] == '1' || argv[i][1] == '2') && argv[i][2] == '=') moves[argv[i][1] - '1'] = argv[i] + 3;
 		guasa_boot_to_select();
 		uint16_t in[2] = { 0, 0 };
-		auto run = [&](int frames, uint16_t p1, uint16_t p2) { for (int f = 0; f < frames; f++) { in[0] = p1; in[1] = p2; guasa_run_frame(in, 0); } };
-		auto dir = [](const std::string& m, size_t k) -> uint16_t {
-			if (k >= m.size()) return 0;
-			char c = m[k];
-			return c == 'L' ? GUASA_LEFT : c == 'R' ? GUASA_RIGHT : c == 'U' ? GUASA_UP : c == 'D' ? GUASA_DOWN : 0;
-		};
-		run(30, 0, 0);
-		for (size_t k = 0; k < moves[0].size() || k < moves[1].size(); k++) { run(4, dir(moves[0], k), dir(moves[1], k)); run(8, 0, 0); }
-		run(4, GUASA_LP, GUASA_LP); run(30, 0, 0); run(4, GUASA_LP, GUASA_LP);
-		int f = 0;
-		for (; f < 4000 && guasa_read_ram(0xFF8DCE) != 0x99; f++) run(1, 0, 0);
-		for (; f < 8000 && guasa_read_ram(0xFF8DCE) != 0x98; f++) run(1, 0, 0);
+		int f = PickAndFight(moves, 0);
 		printf("clock %02x after %d frames; chars %02x %02x\n", guasa_read_ram(0xFF8DCE), f,
 		       guasa_read_ram(0xFF844E + 0x391), guasa_read_ram(0xFF884E + 0x391));
 		const size_t size = guasa_state_size();
@@ -253,6 +335,110 @@ int main(int argc, char** argv)
 		}
 		fclose(sc);
 		fclose(out);
+		guasa_exit();
+		return 0;
+	}
+
+	if (mode == "boxes") {
+		// Hitbox viewer research: like "frames" (same start, same script lines,
+		// p1=/p2= cursor moves) but every frame is drawn, and "bmp <path>" also
+		// prints the boxes of ComputeBoxes() for that frame and the 3 before it:
+		//   box <delay> <obj> <type> <id> <left> <top> <right> <bottom>
+		// (obj 0/1 = P1/P2, 10+ = object slots; delay 0 = RAM after the drawn frame)
+		// and "obj" lines with the raw values; "bmp <path> p1 p2" holds inputs on it.
+		// "trace N p1 p2" runs N frames printing each player's state, anim pointer
+		// and throw words (+64..+6F); "clearthrow 1" zeroes +64..+6B after every
+		// frame; "hash" prints a hash of work RAM without those words.
+		if (argc < 4) { fprintf(stderr, "usage: core_test <roms> boxes <script.txt> [p1=LRUD..] [p2=LRUD..]\n"); return 2; }
+		std::string moves[2];
+		for (int i = 4; i < argc; i++)
+			if (argv[i][0] == 'p' && (argv[i][1] == '1' || argv[i][1] == '2') && argv[i][2] == '=') moves[argv[i][1] - '1'] = argv[i] + 3;
+		guasa_boot_to_select();
+		int f = PickAndFight(moves, 1);
+		printf("clock %02x after %d frames; chars %02x %02x\n", guasa_read_ram(0xFF8DCE), f,
+		       guasa_read_ram(0xFF844E + 0x391), guasa_read_ram(0xFF884E + 0x391));
+		const size_t size = guasa_state_size();
+		std::vector<uint8_t> start(size);
+		guasa_save(start.data(), size);
+		FILE* sc = fopen(argv[3], "r");
+		if (!sc) { fprintf(stderr, "can't open the script\n"); return 1; }
+		std::vector<std::vector<HitBox>> hist;   // hist.back() = after the last frame
+		bool clearThrow = false;   // "clearthrow 1": zero +64..+6B after every frame, so a throw box shows only when written
+		auto step = [&](uint16_t p1, uint16_t p2) {
+			uint16_t in[2] = { p1, p2 };
+			guasa_run_frame(in, 1);
+			hist.push_back(ComputeBoxes());
+			if (hist.size() > 4) hist.erase(hist.begin());
+			if (clearThrow)
+				for (int p = 0; p < 2; p++)
+					for (int k = 0x64; k < 0x6C; k++) guasa_write_ram(0xFF844E + 0x400 * p + k, 0);
+		};
+		auto rawObj = [](int obj, uint32_t base) {
+			uint32_t anim = MemL(base + 0x1A);
+			printf("obj %d base %06x x %d y %d flip %d st %02x anim %06x tab %06x ids", obj, base, (int16_t)MemW(base + 6), (int16_t)MemW(base + 0xA),
+			       guasa_read_mem(base + 0x12), guasa_read_mem(base + 3), anim, MemL(base + 0x34));
+			for (int k = 8; k < 0x0E; k++) printf(" %02x", guasa_read_mem(anim + k));
+			printf(" throw");
+			for (int k = 0x64; k < 0x70; k += 2) printf(" %04x", MemW(base + k));
+			if (int id = guasa_read_mem(anim + 0xC)) {   // the attack box entry, all 16 bytes
+				uint32_t tab = MemL(base + 0x34), e = tab + (int16_t)MemW(tab + 6) + id * 0x10;
+				printf(" atk %06x:", e);
+				for (int k = 0; k < 16; k++) printf(" %02x", guasa_read_mem(e + k));
+			}
+			printf("\n");
+		};
+		char line[512];
+		while (fgets(line, sizeof(line), sc)) {
+			unsigned n, a, b;
+			char path[400];
+			if (line[0] == '=') {
+				guasa_load(start.data(), size);
+				hist.clear();
+				printf("scenario:%s", line + 1);
+			} else if (sscanf(line, "clearthrow %u", &n) == 1) {
+				clearThrow = n != 0;
+			} else if (!strncmp(line, "hash", 4)) {
+				// work RAM without the throw words (+64..+6B of each player): does clearing them change the game?
+				std::vector<uint8_t> ram(0x10000);
+				for (uint32_t i = 0; i < 0x10000; i++) ram[i] = guasa_read_ram(0xFF0000 + i);
+				for (int p = 0; p < 2; p++) memset(&ram[0x844E + 0x400 * p + 0x64], 0, 8);
+				printf("hash %016llx\n", (unsigned long long)guasa_xxh64(ram.data(), ram.size()));
+			} else if (sscanf(line, "mem %x %x", &a, &b) == 2) {
+				for (unsigned k = 0; k < b; k++) {
+					if (k % 16 == 0) printf("%s%06x:", k ? "\n" : "", a + k);
+					printf(" %02x", guasa_read_mem(a + k));
+				}
+				printf("\n");
+			} else if (sscanf(line, "bmp %399s", path) == 1) {
+				unsigned q1 = 0, q2 = 0;   // optional inputs for that frame: bmp <path> p1 p2
+				sscanf(line, "bmp %*s %x %x", &q1, &q2);
+				step((uint16_t)q1, (uint16_t)q2);
+				SaveBmp(path);
+				printf("bmp %s camera %d %d\n", path, (int16_t)MemW(0xFF8ED4), (int16_t)MemW(0xFF8ED8));
+				for (int p = 0; p < 2; p++) rawObj(p, 0xFF844E + 0x400 * p);
+				for (int i = 0; i < 24; i++) {
+					uint32_t base = 0xFF97A2 + 0xC0 * i;
+					if (guasa_read_mem(base) == 1) rawObj(10 + i, base);
+				}
+				for (size_t d = 0; d < hist.size(); d++)
+					for (auto& x : hist[hist.size() - 1 - d])
+						printf("box %zu %d %s %d %d %d %d %d\n", d, x.obj, x.type.c_str(), x.id, x.l, x.t, x.r, x.b);
+			} else if (sscanf(line, "trace %u %x %x", &n, &a, &b) == 3) {
+				for (unsigned k = 0; k < n; k++) {
+					step((uint16_t)a, (uint16_t)b);
+					printf("t%u", k);
+					for (int p = 0; p < 2; p++) {
+						uint32_t base = 0xFF844E + 0x400 * p;
+						printf(" | P%d st %02x.%02x anim %06x thr", p + 1, guasa_read_mem(base + 3), guasa_read_mem(base + 4), MemL(base + 0x1A));
+						for (int k2 = 0x64; k2 < 0x70; k2 += 2) printf(" %04x", MemW(base + k2));
+					}
+					printf("\n");
+				}
+			} else if (sscanf(line, "%u %x %x", &n, &a, &b) == 3) {
+				for (unsigned k = 0; k < n; k++) step((uint16_t)a, (uint16_t)b);
+			}
+		}
+		fclose(sc);
 		guasa_exit();
 		return 0;
 	}

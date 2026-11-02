@@ -25,8 +25,14 @@ enum : uint32_t {
 	kX = 0x06,                        // word; position on the stage
 	kSuper = 0x39C,                   // byte; 0x90 full
 	kClock = 0xFF8DCE,                // BCD; 0x99 during the round's intro, 0x98 once the fight runs
+	kStage = 0xFFE18A,                // word: whose stage the fight is on (a character id; 0x0C Cammy)
 };
 constexpr int kFullLife = 0x90, kFullSuper = 0x90;
+
+constexpr int kOwnStage = -2;
+// Under practice's own stage the game's runs hidden: Vega's, one of the two of the 16
+// that draw no loose sprites (no birds, barrels or dancers) over the grid.
+constexpr uint8_t kOwnStageBase = 0x0B;
 
 enum Stance { kStand, kCrouch, kJump, kBlock, kBlockLow, kBlockAfterHit, kStances };
 const char* StanceName(int s);
@@ -42,6 +48,18 @@ struct HistoryEntry { uint16_t in; int frames; };
 //   +0x1A pointer to the animation frame in ROM: +0x0C attack box (active),
 //         +0x16 = 1 after the last active frame (recovery)
 //   +0x47 hitstop counter, +0x4B stun type (06/08 = block), +0x63 held by a throw
+// Hitboxes: every box of both players and their fireballs, in pixels of the
+// 384x224 picture (found with core_test boxes; the recipe is the one of the
+// hitbox viewer of Fightcade's training mode, checked on this core):
+//   camera: left FF8ED4, top FF8ED8; object at sx = X(+0x06) - left,
+//   sy = 224 - (Y(+0x0A) - 15) + top; +0x12 = 1 facing right; +0x1A animation
+//   frame and +0x34 the character's box table, both in ROM. Each kind of box:
+//   an id in the animation frame and a list in the table (dx, dy, half width,
+//   half height). The picture is 2 frames behind RAM: the boxes are drawn late too.
+enum BoxKind : uint8_t { kBoxHurt, kBoxAttack, kBoxPush };
+struct Box { int16_t l, t, r, b; BoxKind kind; };
+std::vector<struct Box> ComputeBoxes();
+
 enum FrameKind : uint8_t { kFree, kStartup, kActive, kRecovery, kHitstun, kBlockstun, kDown, kAir, kThrow, kFrozen };
 
 class FrameMeter {
@@ -75,6 +93,11 @@ public:
 	int delay = 0;                  // frames the player's buttons arrive late (0-5)
 	bool showHistory = true;
 	bool showFrames = true;         // the frame meter
+	int stage = 0x0C;               // the fight's stage, a character id (Cammy's by default); -1 = the game's choice;
+	                                // kOwnStage = practice's own (a light grid; the game's stage underneath is hidden)
+	bool showBoxes = true, showPush = false;   // hitboxes (hurt blue, attack red); pushboxes (green)
+	// The boxes of the picture on screen now (it's 2 frames behind the game's RAM).
+	const std::vector<Box>& ShownBoxes() const { return m_boxes.front(); }
 	FrameMeter meter;
 	std::vector<uint16_t> tape;     // the rival's recorded buttons
 	size_t tapePos = 0;
@@ -99,9 +122,11 @@ public:
 private:
 	uint16_t Rival(uint16_t p1Local);
 	bool RivalOnRight() const;
+	bool UnderAttack() const;
 	std::vector<uint8_t> m_select, m_spot;
 	std::deque<uint16_t> m_late;
 	uint16_t m_lastLocal = 0;
+	std::deque<std::vector<Box>> m_boxes = std::deque<std::vector<Box>>(3);   // the last 3 frames' boxes, oldest first
 	uint16_t m_held = 0;            // held since the last pick: kept from the game until released
 	bool m_grabHeld = false;
 	int m_lastLife[2] = { kFullLife, kFullLife }, m_still[2] = { 0, 0 };

@@ -232,6 +232,7 @@ static void ReadPlayers(uint16_t in[2], bool keyboard = true)
 static SDL_Window* g_win;
 static SDL_Renderer* g_ren;
 static SDL_Texture* g_tex;
+static SDL_Texture* g_texSprites;   // practice's own stage: the game's picture with its black see-through
 static SDL_AudioStream* g_aud;
 static int g_w, g_h;
 
@@ -961,6 +962,10 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 		st0 = st;
 		streamFrames(false);
 		const NetStats& stats = net.Stats();
+		// with voice chat in the set, the game's sound goes to half, so the players hear each other
+		static float gain = 1.0f;
+		float wantGain = g_voiceRival >= 0 ? 0.5f : 1.0f;
+		if (g_aud && wantGain != gain) { SDL_SetAudioStreamGain(g_aud, wantGain); gain = wantGain; }
 		if (shown && net.Pause().phase == 0) {   // paused: no sound (it would repeat)
 			PushAudio();
 			if (int w = results.Update()) { printf("resultado %d\n", w); fflush(stdout); }
@@ -1049,22 +1054,34 @@ static void Arrow(float cx, float cy, float len, uint16_t in, Uint8 r, Uint8 g, 
 // direction as an arrow and the buttons pressed.
 static void DrawHistory(const SDL_FRect& r, const std::deque<HistoryEntry>& h, bool right, const char* title)
 {
-	float s = r.h / 450 > 1 ? r.h / 450 : 1, row = 15 * s, w = 150 * s;
+	// narrow (as wide as its widest row) and see-through, so it hides little
+	float s = r.h / 450 > 1 ? r.h / 450 : 1, ts = s * 0.85f, row = 13 * s;
+	int most = 0;
+	for (auto& e : h) {
+		int n = 0;
+		for (int b = 0; b < 6; b++) n += (e.in & (GUASA_LP << b)) != 0;
+		most = SDL_max(most, n);
+	}
+	float buttonsAt = 3 * 8 * ts + 20 * s, w = SDL_max(buttonsAt + most * 17 * ts + 4 * s, 40 * s);
 	float x = right ? r.x + r.w - w - 6 * s : r.x + 6 * s, y = r.y + 64 * s;
 	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
-	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 140);
-	SDL_FRect box{ x, y - 14 * s, w, row * h.size() + 18 * s };
+	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 112);
+	SDL_FRect box{ x, y - 13 * s, w, row * h.size() + 16 * s };
 	SDL_RenderFillRect(g_ren, &box);
-	Text(x + 4 * s, y - 11 * s, s, title, 255, 220, 120);
+	Text(x + 3 * s, y - 10 * s, ts, title, 255, 220, 120);
 	static const char* names[6] = { "LP", "MP", "HP", "LK", "MK", "HK" };
 	for (size_t i = 0; i < h.size(); i++) {
 		float ry = y + i * row;
 		char n[8];
 		snprintf(n, sizeof(n), "%3d", h[i].frames);
-		Text(x + 4 * s, ry + 3 * s, s, n, 170, 170, 170);
-		Arrow(x + 40 * s, ry + 7 * s, 5 * s, h[i].in, 255, 255, 255);
+		Text(x + 3 * s, ry + 3 * s, ts, n, 170, 170, 170);
+		Arrow(x + 3 * 8 * ts + 11 * s, ry + 6 * s, 4 * s, h[i].in, 255, 255, 255);
+		float bx = x + buttonsAt;
 		for (int b = 0; b < 6; b++)
-			if (h[i].in & (GUASA_LP << b)) Text(x + (54 + b * 16) * s, ry + 3 * s, s, names[b], b < 3 ? 120 : 255, b < 3 ? 200 : 140, b < 3 ? 255 : 120);
+			if (h[i].in & (GUASA_LP << b)) {   // only the pressed ones, one after the other
+				Text(bx, ry + 3 * s, ts, names[b], b < 3 ? 120 : 255, b < 3 ? 200 : 140, b < 3 ? 255 : 120);
+				bx += 17 * ts;
+			}
 	}
 }
 
@@ -1151,13 +1168,82 @@ static SDL_FRect MenuButton(const SDL_FRect& r)
 	return { r.x + r.w - 62 * s, r.y + r.h - 14 * s, 62 * s, 14 * s };
 }
 
+// Practice's own stage: the game draws only its sprites (fighters, fireballs and
+// the screen's bars) on black; behind them, a light room with a floor and lines
+// that move with the camera like a stage would: near ones every 32 pixels of the
+// stage (stronger every 128), far faint ones at half speed (depth), and lines
+// every 32 pixels up from the floor to measure jumps.
+static void DrawOwnStage(const SDL_FRect& r)
+{
+	auto s16 = [](uint32_t a) { return (int)(int16_t)(guasa_read_ram(a) << 8 | guasa_read_ram(a + 1)); };
+	int left = s16(0xFF8ED4), top = s16(0xFF8ED8);
+	// the floor: where a fighter on the ground stands (the last one seen on it)
+	static int groundY = 40;
+	for (uint32_t p : { kP1, kP2 }) if (guasa_read_ram(p + 3) != 0x04) groundY = s16(p + 0x0A);
+	float kx = r.w / 384, ky = r.h / 224;
+	float floorY = r.y + (224 - (groundY - 15) + top) * ky;
+	auto line = [&](float x0, float y0, float x1, float y1, Uint8 c, Uint8 a) {
+		SDL_SetRenderDrawColor(g_ren, c, c, (Uint8)SDL_min(c + 10, 255), a);
+		SDL_RenderLine(g_ren, x0, y0, x1, y1);
+	};
+	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+	SDL_SetRenderDrawColor(g_ren, 236, 238, 243, 255);   // the room
+	SDL_RenderFillRect(g_ren, &r);
+	for (int k = -1; k < 384 / 64 + 2; k++) {   // far: half the camera's speed
+		float x = r.x + (k * 64 - (left / 2) % 64) * kx;
+		line(x, r.y, x, floorY, 222, 255);
+	}
+	SDL_SetRenderDrawColor(g_ren, 222, 225, 232, 255);   // the floor
+	SDL_FRect floor{ r.x, floorY, r.w, r.y + r.h - floorY };
+	SDL_RenderFillRect(g_ren, &floor);
+	for (int k = -1; k < 384 / 32 + 2; k++) {   // near: with the stage, every 32 pixels
+		int wx = (left / 32 + k) * 32;
+		float x = r.x + (wx - left) * kx;
+		bool strong = wx % 128 == 0;
+		line(x, floorY, x, r.y + r.h, strong ? 150 : 190, 255);
+		line(x, r.y + 24 * ky, x, floorY, strong ? 200 : 214, 255);
+	}
+	for (int h = 32; h < 200; h += 32) {   // heights above the floor
+		float y = floorY - h * ky;
+		if (y > r.y + 20 * ky) line(r.x, y, r.x + r.w, y, 214, 255);
+	}
+	SDL_SetRenderDrawColor(g_ren, 120, 128, 146, 255);   // the floor's edge, two pixels
+	SDL_RenderLine(g_ren, r.x, floorY, r.x + r.w, floorY);
+	SDL_RenderLine(g_ren, r.x, floorY + 1, r.x + r.w, floorY + 1);
+	// the game's picture on top, its black see-through
+	static std::vector<uint32_t> px;
+	int w, h, pitch;
+	const uint16_t* fb = guasa_framebuffer(&w, &h, &pitch);
+	px.resize((size_t)w * h);
+	for (int y = 0; y < h; y++) {
+		const uint16_t* row = (const uint16_t*)((const uint8_t*)fb + y * pitch);
+		for (int x = 0; x < w; x++) {
+			uint16_t c = row[x];
+			px[(size_t)y * w + x] = c == 0 ? 0 : 0xFF000000u | (uint32_t)((c >> 11) << 3 | (c >> 13)) << 16 |
+				(uint32_t)(((c >> 5) & 63) << 2 | ((c >> 9) & 3)) << 8 | (uint32_t)((c & 31) << 3 | ((c >> 2) & 7));
+		}
+	}
+	if (!g_texSprites) {
+		g_texSprites = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+		SDL_SetTextureScaleMode(g_texSprites, SDL_SCALEMODE_NEAREST);
+		SDL_SetTextureBlendMode(g_texSprites, SDL_BLENDMODE_BLEND);
+	}
+	SDL_UpdateTexture(g_texSprites, NULL, px.data(), w * 4);
+	SDL_RenderTexture(g_ren, g_texSprites, NULL, &r);
+}
+
 static void DrawPractice(const Practice& P, const std::vector<MenuItem>* menu, int sel, const std::string& note)
 {
-	SDL_UpdateTexture(g_tex, NULL, guasa_framebuffer(NULL, NULL, NULL), g_w * 2);
 	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 255);
 	SDL_RenderClear(g_ren);
 	SDL_FRect r = GameRect();
-	SDL_RenderTexture(g_ren, g_tex, NULL, &r);
+	bool own = P.stage == kOwnStage && P.phase == Practice::Fight;
+	guasa_set_layers(own ? 0x01 : 0xFF);   // its own stage: only the game's sprites (from the next frame)
+	if (own) DrawOwnStage(r);
+	else {
+		SDL_UpdateTexture(g_tex, NULL, guasa_framebuffer(NULL, NULL, NULL), g_w * 2);
+		SDL_RenderTexture(g_ren, g_tex, NULL, &r);
+	}
 	float s = r.h / 450 > 1 ? r.h / 450 : 1;
 	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
 	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 160);
@@ -1166,6 +1252,22 @@ static void DrawPractice(const Practice& P, const std::vector<MenuItem>* menu, i
 	SDL_RenderFillRect(g_ren, &bottom);
 	Text(r.x + 6 * s, r.y + 3 * s, s, P.Status().c_str(), 255, 220, 120);
 	Text(r.x + 6 * s, r.y + r.h - 11 * s, s, "MONEDA, Tab o clic derecho: menu    START: volver a la posicion    Esc: salir", 200, 200, 200);
+	if ((P.showBoxes || P.showPush) && P.phase == Practice::Fight) {   // hurt blue, attack red, push green
+		float kx = r.w / 384, ky = r.h / 224;
+		SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+		for (const Box& b : P.ShownBoxes()) {
+			if (b.kind == kBoxPush ? !P.showPush : !P.showBoxes) continue;
+			static const Uint8 c[3][3] = { { 60, 130, 255 }, { 255, 40, 40 }, { 60, 220, 90 } };
+			const Uint8* k = c[b.kind];
+			SDL_FRect f{ r.x + b.l * kx, r.y + b.t * ky, (b.r - b.l) * kx, (b.b - b.t) * ky };
+			SDL_SetRenderDrawColor(g_ren, k[0], k[1], k[2], 45);
+			SDL_RenderFillRect(g_ren, &f);
+			SDL_SetRenderDrawColor(g_ren, k[0], k[1], k[2], 255);
+			SDL_RenderRect(g_ren, &f);
+			SDL_FRect in{ f.x + 1, f.y + 1, f.w - 2, f.h - 2 };   // two pixels thick
+			SDL_RenderRect(g_ren, &in);
+		}
+	}
 	if (P.showFrames && P.phase == Practice::Fight) DrawFrameMeter(r, P.meter);
 	if (P.showHistory && P.phase == Practice::Fight) {
 		DrawHistory(r, P.history[0], false, "TU");
@@ -1227,6 +1329,7 @@ static void PracticeOptions(Practice& P, bool save)
 	struct { const char* name; int* i; bool* b; } opts[] = {
 		{ "rival", &P.stance, NULL }, { "delay", &P.delay, NULL }, { "vida", NULL, &P.refillLife }, { "reloj", NULL, &P.freezeClock },
 		{ "super", NULL, &P.fullSuper }, { "historial", NULL, &P.showHistory }, { "medidor", NULL, &P.showFrames },
+		{ "cajas", NULL, &P.showBoxes }, { "empuje", NULL, &P.showPush }, { "escenario", &P.stage, NULL },
 	};
 	std::string path = PrefFile("practica.txt");
 	FILE* f = fopen(path.c_str(), save ? "w" : "r");
@@ -1241,6 +1344,7 @@ static void PracticeOptions(Practice& P, bool save)
 				if (!strcmp(name, o.name)) { if (o.i) *o.i = v; else *o.b = v != 0; }
 		if (P.stance < 0 || P.stance >= kStances) P.stance = kStand;
 		if (P.delay < 0 || P.delay > 5) P.delay = 0;
+		if (P.stage != 0x0C && P.stage != kOwnStage) P.stage = -1;
 	}
 	fclose(f);
 }
@@ -1266,6 +1370,7 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 	Practice P;
 	P.Start();
 	if (shots.empty()) PracticeOptions(P, false);   // the script always starts the same
+	else if (SDL_getenv("GUASA_ESCENARIO_PROPIO")) P.stage = kOwnStage;   // the script's pictures with practice's own stage
 	if (!OpenWindow("La Guasabara - Practica")) return 1;
 	LoadMaps();
 	printf("practica\n");
@@ -1303,6 +1408,15 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 			item("Delay como en linea", std::to_string(P.delay), "F9", [&](int d) { P.delay = (P.delay + d + 6) % 6; }),
 			Header("PANTALLA"),
 			item("Historial de botones", yesNo(P.showHistory), "F2", [&](int) { P.showHistory = !P.showHistory; }),
+			item("Escenario", P.stage == 0x0C ? "Cammy" : P.stage == kOwnStage ? "practica" : "el del juego", "", [&](int d) {
+				static const int order[3] = { 0x0C, kOwnStage, -1 };
+				int i = P.stage == 0x0C ? 0 : P.stage == kOwnStage ? 1 : 2;
+				int was = P.stage;
+				P.stage = order[(i + d + 3) % 3];
+				if ((was == -1) != (P.stage == -1) || (was == 0x0C && P.stage == -1)) say("El escenario cambia en la proxima pelea (F10)");
+			}),
+			item("Cajas de golpe", yesNo(P.showBoxes), "", [&](int) { P.showBoxes = !P.showBoxes; }),
+			item("Cajas de empuje", yesNo(P.showPush), "", [&](int) { P.showPush = !P.showPush; }),
 			item("Medidor de frames", yesNo(P.showFrames), "F12", [&](int) { P.showFrames = !P.showFrames; }),
 			Header("SALIR"),
 			item("Cambiar de personajes", "", "F10", [&](int) { P.ChangeCharacters(); menuOpen = false; }),
@@ -1386,6 +1500,7 @@ static int PlayPractice(const char* roms, const std::string& shots = "")
 			if (k >= 0 && k < 80) in[0] = GUASA_RIGHT;
 			if (k >= 80 && k < 200 && k % 24 < 3) in[0] = k % 48 < 24 ? GUASA_DOWN | GUASA_MK : GUASA_HP;
 			if (k >= 200 && k < 215) in[0] = GUASA_DOWN | GUASA_RIGHT;
+			for (int g : { 108, 110, 112 }) if (k == g) { DrawPractice(P, NULL, 0, ""); SaveWindow(shots + "/practica-golpe-" + std::to_string(g) + ".bmp"); }
 			if (k == 230) { DrawPractice(P, NULL, 0, "Posicion guardada"); SaveWindow(shots + "/practica-pelea.bmp"); }
 			if (k == 232) in[0] = GUASA_COIN;
 			if (k == 236) in[0] = GUASA_DOWN;
@@ -1447,6 +1562,14 @@ static int PracticeSelfTest(const char* roms)
 	auto frame = [&](uint16_t local) { uint16_t out[2]; P.Inputs(local, -1, out); guasa_run_frame(out, 0); P.AfterFrame(out); return out[0]; };
 	auto run = [&](int n, uint16_t local) { for (int i = 0; i < n; i++) frame(local); };
 	auto life2 = [] { return (int)(int16_t)ReadWord(kP2 + kLife); };
+
+	// nobody picks: the select screen's timer does, and practice starts all the same
+	{
+		int f = 0;
+		while (P.phase != Practice::Fight && f++ < 6000) { uint16_t out[2]; P.Inputs(0, -1, out); guasa_run_frame(out, 0); P.AfterFrame(out); }
+		check(P.phase == Practice::Fight && P.HasPosition(), "si el reloj de la seleccion elige solo, la practica empieza igual", std::to_string(f) + " cuadros");
+		P.ChangeCharacters();
+	}
 	auto x2 = [] { return (int)ReadWord(kP2 + kX); };
 	auto char2 = [] { return (int)guasa_read_ram(kP2 + 0x391); };
 	// the rival's cursor moves one way, then the rival is picked (the button that
@@ -1462,6 +1585,7 @@ static int PracticeSelfTest(const char* roms)
 	check(P.phase == Practice::PickRival, "con el primer golpe se elige tu personaje y sigue el del rival");
 	int f = pickRival(GUASA_RIGHT), rivalRight = char2();
 	check(P.phase == Practice::Fight && P.HasPosition(), "empieza la pelea y queda guardada la posicion", std::to_string(f) + " cuadros");
+	check(ReadWord(kStage) == 0x0C, "la pelea es en el escenario de Cammy", std::to_string(ReadWord(kStage)));
 
 	// an attack against a rival that blocks, and against one that stands
 	auto attack = [&](int stance) {
@@ -1472,6 +1596,13 @@ static int PracticeSelfTest(const char* roms)
 		for (int k = 0; k < 12; k++) { run(3, GUASA_HP); run(20, 0); least = std::min(least, life2()); }
 		return least;
 	};
+	// blocking without being attacked: it stays where it is (holding back all the
+	// time would walk it off to the corner)
+	P.LoadPosition();
+	P.stance = kBlock;
+	int before = x2();
+	run(120, 0);
+	check(x2() == before, "el rival que bloquea no se va caminando si no lo atacan", std::to_string(before) + " -> " + std::to_string(x2()));
 	int blocked = attack(kBlock), hit = attack(kStand);
 	check(blocked == kFullLife, "el rival que bloquea no pierde vida", "vida minima " + std::to_string(blocked));
 	check(hit < kFullLife, "el rival de pie si recibe los golpes", "vida minima " + std::to_string(hit));
@@ -1493,6 +1624,30 @@ static int PracticeSelfTest(const char* roms)
 	std::string without = knockdown(false), with = knockdown(true);
 	P.refillLife = true;
 	check(with == without, "derribado, el rival se levanta igual con la vida que se recupera");
+
+	// the boxes: each player has body boxes, player 1's left of player 2's, and a
+	// heavy punch up close has an attack box on the rival
+	{
+		P.LoadPosition();
+		std::vector<Box> b = ComputeBoxes();
+		int hurt[2] = { 0, 0 }, mid[2] = { 0, 0 };
+		for (const Box& x : b) if (x.kind == kBoxHurt) { int p = (x.l + x.r) / 2 < 192 ? 0 : 1; hurt[p]++; mid[p] += (x.l + x.r) / 2; }
+		check(hurt[0] >= 3 && hurt[1] >= 3, "cajas: cada jugador tiene sus cajas de cuerpo (cabeza, cuerpo, piernas)",
+		      std::to_string(hurt[0]) + " y " + std::to_string(hurt[1]));
+		run(100, GUASA_RIGHT);
+		run(20, 0);
+		bool attack = false, onRival = false;
+		for (int k = 0; k < 20 && !onRival; k++) {
+			frame(k < 3 ? GUASA_HP : 0);
+			std::vector<Box> now = ComputeBoxes();
+			for (const Box& a : now) if (a.kind == kBoxAttack) {
+				attack = true;
+				for (const Box& h : now)   // overlapping one of the rival's (the right one's) body boxes
+					if (h.kind == kBoxHurt && (h.l + h.r) / 2 > (a.l + a.r) / 2 && a.r >= h.l && a.l <= h.r && a.b >= h.t && a.t <= h.b) onRival = true;
+			}
+		}
+		check(attack && onRival, "cajas: el golpe fuerte de cerca tiene caja roja sobre el rival");
+	}
 
 	// the frame meter, against what core_test frames measured for Ryu vs Ken
 	// (±1 frame: the game sometimes runs two ticks in one frame)

@@ -527,6 +527,11 @@ uint8_t guasa_read_ram(uint32_t address)
 	return CpsRamFF[(address & 0xFFFF) ^ 1];   // stored as little-endian 16-bit words
 }
 
+void guasa_set_layers(uint8_t mask)
+{
+	nBurnLayer = mask;
+}
+
 uint8_t guasa_read_mem(uint32_t address)
 {
 	address &= 0xFFFFFF;

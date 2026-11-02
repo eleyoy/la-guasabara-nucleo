@@ -1,5 +1,6 @@
 // Practice mode: see practica.h.
 #include "practica.h"
+#include <stdlib.h>
 #include "guasa_core.h"
 
 static const uint16_t kButtons = GUASA_LP | GUASA_MP | GUASA_HP | GUASA_LK | GUASA_MK | GUASA_HK;
@@ -63,6 +64,45 @@ FrameKind FrameMeter::Classify(int p)
 	if (st == 0x08 && m_state[p] == 0x0E) return kBlockstun;   // one more frame after blocking
 	if (st == 0x04) return sub == 0x04 && m_state[p] == 0x04 && m_sub[p] == 0x04 ? kFree : kAir;   // landing: free from its 2nd frame
 	return kFree;
+}
+
+static int16_t S16(uint32_t a) { return (int16_t)(guasa_read_mem(a) << 8 | guasa_read_mem(a + 1)); }
+static uint32_t U32(uint32_t a) { return (uint32_t)(uint16_t)S16(a) << 16 | (uint16_t)S16(a + 2); }
+
+std::vector<Box> ComputeBoxes()
+{
+	std::vector<Box> out;
+	const int left = S16(0xFF8ED4), top = S16(0xFF8ED8);
+	auto object = [&](uint32_t base, bool player) {
+		int sx = S16(base + 0x06) - left, sy = 224 - (S16(base + 0x0A) - 15) + top;
+		bool flip = guasa_read_mem(base + 0x12) == 1;
+		uint32_t anim = U32(base + 0x1A), tab = U32(base + 0x34);
+		if (!anim || !tab || anim >= 0xFF0000 || tab >= 0xFF0000) return;
+		// which table offset, which id byte in the animation frame, entry size, kind
+		struct { int tabOff, idAt, size; BoxKind kind; } kinds[] = {
+			{ 8, 0x0D, 4, player ? kBoxPush : kBoxHurt },   // on a fireball: where it can be hit
+			{ 0, 0x08, 4, kBoxHurt }, { 2, 0x09, 4, kBoxHurt }, { 4, 0x0A, 4, kBoxHurt },   // head, body, legs
+			{ 6, 0x0C, 16, kBoxAttack },
+		};
+		for (auto& k : kinds) {
+			if (k.kind == kBoxAttack && player && guasa_read_mem(base + 0x03) == 0) continue;
+			int id = guasa_read_mem(anim + k.idAt);
+			if (!id) continue;
+			uint32_t e = tab + S16(tab + k.tabOff) + id * k.size;
+			int dx = (int8_t)guasa_read_mem(e), dy = (int8_t)guasa_read_mem(e + 1);
+			int rx = guasa_read_mem(e + 2), ry = guasa_read_mem(e + 3);
+			if (k.kind == kBoxAttack && player && guasa_read_mem(e + 5) >= 0x80) dx = -(int)guasa_read_mem(e + 5);
+			if (!rx || !ry) continue;
+			int cx = sx + (flip ? -dx : dx), cy = sy - dy;
+			out.push_back({ (int16_t)(cx - rx), (int16_t)(cy - ry), (int16_t)(cx + rx), (int16_t)(cy + ry), k.kind });
+		}
+	};
+	for (uint32_t p : { kP1, kP2 }) if (guasa_read_mem(p)) object(p, true);
+	for (int i = 0; i < 8; i++) {   // fireballs
+		uint32_t base = 0xFF97A2 + 0xC0 * i;
+		if ((uint16_t)S16(base) == 0x0101) object(base, false);
+	}
+	return out;
 }
 
 void FrameMeter::Update()
@@ -147,7 +187,9 @@ uint16_t Practice::Rival(uint16_t)
 		uint16_t v = tape[tapePos++ % tape.size()];
 		return RivalOnRight() == m_tapeOnRight ? v : Mirror(v);
 	}
-	uint16_t away = RivalOnRight() ? GUASA_RIGHT : GUASA_LEFT;
+	// Holding back only while the player attacks (or a fireball is out): held all
+	// the time, back is walking away, and the rival would go off to the corner.
+	uint16_t away = UnderAttack() ? (RivalOnRight() ? GUASA_RIGHT : GUASA_LEFT) : 0;
 	switch (stance) {
 	case kCrouch: return GUASA_DOWN;
 	case kJump: return GUASA_UP;
@@ -156,6 +198,16 @@ uint16_t Practice::Rival(uint16_t)
 	case kBlockAfterHit: return m_blockFor > 0 ? GUASA_DOWN | away : 0;
 	default: return 0;
 	}
+}
+
+// The player is attacking (state 0A normal, 0C special, or a jump attack), or a fireball is out.
+bool Practice::UnderAttack() const
+{
+	uint8_t st = guasa_read_ram(kP1 + 3), sub = guasa_read_ram(kP1 + 4);
+	if (st == 0x0A || st == 0x0C || (st == 0x04 && sub == 0x06)) return true;
+	for (uint32_t o = 0xFF97A2; o < 0xFF97A2 + 8 * 0xC0; o += 0xC0)
+		if (guasa_read_ram(o) == 0x01 && guasa_read_ram(o + 1) == 0x01) return true;
+	return false;
 }
 
 void Practice::Inputs(uint16_t local, int second, uint16_t out[2])
@@ -196,13 +248,20 @@ void Practice::AfterFrame(const uint16_t used[2])
 	// The clock shows 99 already during the round's intro, before anyone can move;
 	// its first tick (99 -> 98) is when the fight really starts.
 	uint8_t clock = guasa_read_ram(kClock);
-	bool started = phase == WaitFight && clock == 0x98 && m_lastClock == 0x99;
+	// before the fight: the stage the player wants (the game reads it when the fight loads)
+	if (phase != Fight && stage != -1) { guasa_write_ram(kStage, 0); guasa_write_ram(kStage + 1, stage == kOwnStage ? kOwnStageBase : (uint8_t)stage); }
+	// From any phase: if the select screen's timer ran out, the game picked the
+	// characters itself and the fight starts without the player's picks.
+	bool started = phase != Fight && clock == 0x98 && m_lastClock == 0x99;
 	m_lastClock = clock;
 	if (started) {
 		phase = Fight;
 		if (freezeClock) guasa_write_ram(kClock, 0x99);
 		if (m_spot.empty()) SavePosition();   // "volver a la posición" works from the first second
 	}
+	// the boxes of this frame; the picture shows them two frames from now
+	m_boxes.pop_front();
+	m_boxes.push_back(phase == Fight && (showBoxes || showPush) ? ComputeBoxes() : std::vector<Box>());
 	if (phase == Fight) {
 		meter.Update();
 		if (freezeClock) guasa_write_ram(kClock, 0x99);

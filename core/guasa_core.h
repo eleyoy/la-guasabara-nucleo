@@ -74,6 +74,10 @@ void guasa_write_ram(uint32_t address, uint8_t value);
  * animation and hitbox tables) or work RAM; anything else reads 0. Read-only,
  * for practice-mode tools such as the frame meter. */
 uint8_t guasa_read_mem(uint32_t address);
+/* Which background layers are drawn (bit 1 scroll 1, bit 2 scroll 2, bit 3 scroll 3;
+ * sprites always). Only the picture changes, never the game: practice mode's
+ * own stage hides the game's. Default: all (0xFF). */
+void guasa_set_layers(uint8_t mask);
 
 /* The last drawn frame: RGB565, width x height, pitch in bytes. */
 const uint16_t* guasa_framebuffer(int* width, int* height, int* pitch);
