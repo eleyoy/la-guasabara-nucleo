@@ -6,7 +6,7 @@
 // - the rival (player 2) stands, crouches, jumps, blocks, or plays back what the
 //   player recorded while controlling it (turned around if the sides changed);
 // - life comes back after a second without being hit, the clock stays at 99 and
-//   the super meter can stay full (writing the game's RAM: never online);
+//   the super meter is always full (writing the game's RAM: never online);
 // - one saved position to go back to, in memory only (never a file: players
 //   don't get savestates);
 // - the player's buttons can arrive a few frames late, like online;
@@ -21,17 +21,20 @@
 #include <string>
 #include <vector>
 
-// RAM (appendix C of the plan; position and super meter found with core_test explore)
+// RAM (appendix C of the plan; the position found with core_test explore, the super
+// meter by filling it with hadokens and trying Ryu's super with each candidate)
 enum : uint32_t {
 	kP1 = 0xFF844E, kP2 = 0xFF884E,   // each player's block
 	kLife = 0x2A,                     // word; 0x90 full
 	kLifeCopy = 0x2C, kLifeBar = 0x1BC,   // the same life, kept twice more (all three go together)
 	kX = 0x06,                        // word; position on the stage
-	kSuper = 0x39C,                   // byte; 0x90 full
+	kSuper = 0x2B4,                   // byte; 0x30 full (what the game checks for a super)
+	kSuperBar = 0x2B3,                // the bar drawn, which follows kSuper a little later
+	                                  // (+0x39C, taken for the super before, is part of the score)
 	kClock = 0xFF8DCE,                // BCD; 0x99 during the round's intro, 0x98 once the fight runs
 	kStage = 0xFFE18A,                // word: whose stage the fight is on (a character id; 0x0C Cammy)
 };
-constexpr int kFullLife = 0x90, kFullSuper = 0x90;
+constexpr int kFullLife = 0x90, kFullSuper = 0x30;
 
 constexpr int kOwnStage = -2;
 // Under practice's own stage the game's runs hidden: Vega's, one of the two of the 16
@@ -119,7 +122,7 @@ public:
 	bool controlRival = false;      // the player moves the rival (to record it, or to try it)
 	Rec rec = NoRec;
 	bool replay = false;            // the rival plays the recording over and over
-	bool refillLife = true, freezeClock = true, fullSuper = false;
+	bool refillLife = true, freezeClock = true;   // the super meter is always full
 	int delay = 0;                  // frames the player's buttons arrive late (0-5)
 	bool showHistory = true;
 	bool showFrames = true;         // the frame meter
@@ -166,10 +169,15 @@ private:
 	int m_blockFor = 0;
 	bool m_tapeOnRight = true;
 	uint8_t m_lastClock = 0;
+	int m_resaveIn = 0;             // frames left to save the fight's first position again
 	// the reversal on its way: its buttons, played from frame m_seqStart on (frames counted by m_seqFrame)
 	enum Moment { kNone, kDownNow, kBlockingNow };
 	Moment RivalMoment() const;
 	void PlanReversal(int what);
+	bool ReversalButtons(int what, std::vector<uint16_t>& seq, int& anchor) const;
+	std::vector<std::vector<uint8_t>> m_ahead;   // states played ahead (kept so they aren't allocated each time)
+	void KeepFull();
+	void Refill(int lastLife[2], int still[2]) const;
 	std::vector<uint16_t> m_seq;
 	int m_seqStart = 0, m_seqFrame = 0;
 	Moment m_moment = kNone;

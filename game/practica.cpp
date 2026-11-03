@@ -1,5 +1,6 @@
 // Practice mode: see practica.h.
 #include "practica.h"
+#include <algorithm>
 #include <stdlib.h>
 #include "guasa_core.h"
 
@@ -248,49 +249,135 @@ Practice::Moment Practice::RivalMoment() const
 	return kNone;
 }
 
-// The rival's first free frame, found by playing ahead from a copy of the state
-// (nobody pressing anything), then the reversal's buttons placed so that its
-// button comes 1 frame before it (the game keeps it, and does the move on that
-// first frame).
-void Practice::PlanReversal(int what)
+// The reversal's buttons, and which of them (anchor) is the one that must come
+// right before the rival's first free frame. False if there's nothing to do.
+bool Practice::ReversalButtons(int what, std::vector<uint16_t>& seq, int& anchor) const
 {
-	m_seq.clear();
-	std::vector<uint8_t> now(guasa_state_size());
-	guasa_save(now.data(), now.size());
-	int free = -1;
-	for (int i = 0; i < 240 && free < 0; i++) {
-		uint16_t none[2] = { 0, 0 };
-		guasa_run_frame(none, 0);
-		uint8_t st = guasa_read_ram(kP2 + 3);
-		if (st != 0x0E && st != 0x14 && !guasa_read_ram(kP2 + 0x63)) free = i;
-	}
-	guasa_load(now.data(), now.size());
-	if (free < 0) return;
 	const uint16_t back = RivalOnRight() ? GUASA_RIGHT : GUASA_LEFT;
-	std::vector<uint16_t> seq;
-	int anchor = 0;   // the frame of seq that must come 1 frame before the first free one
+	seq.clear();
+	anchor = 0;
 	switch (what) {
 	case kReactTape: {
-		if (tape.empty()) return;
+		if (tape.empty()) return false;
 		bool flip = RivalOnRight() != m_tapeOnRight;
 		size_t first = 0, button = tape.size();
 		while (first < tape.size() && !tape[first]) first++;   // what was recorded before moving: nothing
 		for (size_t i = first; i < tape.size() && button == tape.size(); i++) if (tape[i] & kButtons) button = i;
-		if (first == tape.size()) return;
+		if (first == tape.size()) return false;
 		if (button == tape.size()) button = first;   // only moving (a jump, a dash): from its first frame
 		if (button - first > 20) first = button - 20;   // a special's motion is shorter than that
 		for (size_t i = first; i < tape.size(); i++) seq.push_back(flip ? Mirror(tape[i]) : tape[i]);
 		anchor = (int)(button - first);
-		break;
+		return true;
 	}
-	case kReactJumpBack: seq.assign(4, (uint16_t)(GUASA_UP | back)); break;
-	case kReactSweep: seq.assign(4, (uint16_t)(GUASA_DOWN | GUASA_HK)); break;
-	case kReactHeavy: seq.assign(4, (uint16_t)GUASA_HP); break;
-	default: return;
+	case kReactJumpBack: seq.assign(4, (uint16_t)(GUASA_UP | back)); return true;
+	// a normal needs a fresh press once the rival can act: pressed every other frame
+	case kReactSweep: seq = { GUASA_DOWN | GUASA_HK, GUASA_DOWN, GUASA_DOWN | GUASA_HK, GUASA_DOWN, GUASA_DOWN | GUASA_HK, GUASA_DOWN }; return true;
+	case kReactHeavy: seq = { GUASA_HP, 0, GUASA_HP, 0, GUASA_HP, 0 }; return true;
+	default: return false;
 	}
+}
+
+static bool RivalStunned()   // hit, blocking, knocked down or thrown
+{
+	uint8_t st = guasa_read_ram(kP2 + 3);
+	return st == 0x0E || st == 0x14 || guasa_read_ram(kP2 + 0x63);
+}
+
+static bool RivalActing()   // attacking, a special, or jumping
+{
+	uint8_t st = guasa_read_ram(kP2 + 3);
+	return st == 0x0A || st == 0x0C || st == 0x04;
+}
+
+// When the reversal's buttons go. Played ahead from a copy of the state in
+// memory (nobody pressing anything, practice's writes the same as every frame):
+// the rival's first free frame. The button goes 1 frame before it (the game keeps
+// a special's button that long and does it on that first frame). Then that is
+// tried ahead too, and a few frames earlier or later, and the timing whose move
+// starts soonest is kept: specials and jumps come out on the first free frame,
+// a normal (a heavy punch, a sweep) the game lets out a couple of frames later.
+// Then back to the copy: nothing of this is seen or heard.
+void Practice::PlanReversal(int what)
+{
+	m_seq.clear();
+	std::vector<uint16_t> seq;
+	int anchor = 0;
+	if (!ReversalButtons(what, seq, anchor)) return;
+	const size_t n = guasa_state_size();
+	std::vector<uint8_t> now(n);
+	guasa_save(now.data(), n);
+	const int kKeep = 32;   // the last states ahead, to try the timings from close to the end
+	if (m_ahead.size() != (size_t)kKeep) m_ahead.assign(kKeep, std::vector<uint8_t>(n));
+	// what every real frame does after it, ahead too (with copies of the counters):
+	// refilling the life while the rival is down changes when it gets up
+	int lastLife[2], still[2], aheadLife[kKeep][2], aheadStill[kKeep][2];
+	auto upkeep = [&] { KeepFull(); Refill(lastLife, still); };
+	std::copy(m_lastLife, m_lastLife + 2, lastLife);
+	std::copy(m_still, m_still + 2, still);
+	int free = -1;
+	upkeep();   // this frame's, which comes after this plan
+	for (int i = 0; i < 240 && free < 0; i++) {
+		guasa_save(m_ahead[i % kKeep].data(), n);   // the state before frame i, and its counters
+		std::copy(lastLife, lastLife + 2, aheadLife[i % kKeep]);
+		std::copy(still, still + 2, aheadStill[i % kKeep]);
+		uint16_t none[2] = { 0, 0 };
+		guasa_run_frame(none, 0);
+		upkeep();
+		if (!RivalStunned()) free = i;
+	}
+	int base = free - 1 - anchor, chosen = base;
+	if (free >= 0) {
+		int from = std::max({ 0, base - 2, free - kKeep + 1 });
+		int best = 1 << 30;   // the frame its move starts, the earliest of the timings tried
+		for (int d : { 0, -1, 1, -2, 2, 3 }) {
+			int start = base + d;
+			if (start < from) continue;
+			guasa_load(m_ahead[from % kKeep].data(), n);
+			std::copy(aheadLife[from % kKeep], aheadLife[from % kKeep] + 2, lastLife);
+			std::copy(aheadStill[from % kKeep], aheadStill[from % kKeep] + 2, still);
+			int moved = -1;
+			for (int i = from; i <= free + 8 && moved < 0; i++) {
+				int k = i - start;
+				uint16_t in[2] = { 0, (uint16_t)(k >= 0 && k < (int)seq.size() ? seq[k] : 0) };
+				guasa_run_frame(in, 0);
+				upkeep();
+				if (i >= free && RivalActing()) moved = i;
+			}
+			if (moved >= 0 && moved < best) { best = moved; chosen = start; }
+			if (best == free) break;   // on the very first free frame: none can be better
+		}
+	}
+	guasa_load(now.data(), n);
+	if (free < 0) return;
 	m_seq = seq;
 	m_seqFrame = 0;
-	m_seqStart = free - 1 - anchor;   // can be under 0: the start of the motion is lost, the button still comes in time
+	m_seqStart = chosen;   // can be under 0: the start of the motion is lost, the button still comes in time
+}
+
+// What practice writes after every frame of the fight: the clock at 99 and the
+// super meters full (the bar drawn follows by itself).
+void Practice::KeepFull()
+{
+	if (freezeClock) guasa_write_ram(kClock, 0x99);
+	for (uint32_t p : { kP1, kP2 }) guasa_write_ram(p + kSuper, kFullSuper);
+}
+
+// Life back to full after a second without being hit (not on a K.O., which ends
+// the round). The game keeps life in three places; writing only the first one,
+// it sees them differ and takes it for a new hit (the rival fell down again).
+// lastLife and still: each player's life last frame and frames without a hit.
+void Practice::Refill(int lastLife[2], int still[2]) const
+{
+	for (int p = 0; p < 2; p++) {
+		int life = (int16_t)ReadWord((p ? kP2 : kP1) + kLife);
+		still[p] = life == lastLife[p] ? still[p] + 1 : 0;
+		lastLife[p] = life;
+		if (refillLife && life > 0 && life < kFullLife && still[p] >= 60) {
+			for (uint32_t copy : { kLife, kLifeCopy, kLifeBar }) WriteWord((p ? kP2 : kP1) + copy, kFullLife);
+			lastLife[p] = kFullLife;
+		}
+	}
 }
 
 // The player is attacking (state 0A normal, 0C special, or a jump attack), or a fireball is out.
@@ -349,9 +436,16 @@ void Practice::AfterFrame(const uint16_t used[2])
 	m_lastClock = clock;
 	if (started) {
 		phase = Fight;
-		if (freezeClock) guasa_write_ram(kClock, 0x99);
-		if (m_spot.empty()) SavePosition();   // "volver a la posición" works from the first second
+		KeepFull();
+		if (m_spot.empty()) {
+			SavePosition();   // "volver a la posición" works from the first second
+			m_resaveIn = 45;
+		}
 	}
+	// Saved again once the game has the super meters full (its bar and what goes with
+	// it take a moment): a position with them empty, filled right after loading it,
+	// left the rival unable to do its reversal.
+	if (phase == Fight && m_resaveIn > 0 && --m_resaveIn == 0) SavePosition();
 	// the boxes of this frame; the picture shows them two frames from now
 	m_boxes.pop_front();
 	m_boxes.push_back(phase == Fight && (showBoxes || showPush) ? ComputeBoxes() : std::vector<Box>());
@@ -370,25 +464,11 @@ void Practice::AfterFrame(const uint16_t used[2])
 			if (what != kReactNothing) PlanReversal(what);
 		}
 		m_moment = m;
-		if (freezeClock) guasa_write_ram(kClock, 0x99);
-		if (fullSuper) { guasa_write_ram(kP1 + kSuper, kFullSuper); guasa_write_ram(kP2 + kSuper, kFullSuper); }
-		for (int p = 0; p < 2; p++) {
-			uint32_t at = (p ? kP2 : kP1) + kLife;
-			int life = (int16_t)ReadWord(at);
-			if (p == 1) {
-				if (life < m_lastLife[1]) m_blockFor = 40;   // just got hit
-				else if (m_blockFor > 0) m_blockFor--;
-			}
-			m_still[p] = life == m_lastLife[p] ? m_still[p] + 1 : 0;
-			m_lastLife[p] = life;
-			// a second without being hit: full again (not on a K.O., which ends the round)
-			// The game keeps life in three places; writing only the first one, it sees
-			// them differ and takes it for a new hit (the rival fell down again).
-			if (refillLife && life > 0 && life < kFullLife && m_still[p] >= 60) {
-				for (uint32_t copy : { kLife, kLifeCopy, kLifeBar }) WriteWord((p ? kP2 : kP1) + copy, kFullLife);
-				m_lastLife[p] = kFullLife;
-			}
-		}
+		KeepFull();
+		int life2 = (int16_t)ReadWord(kP2 + kLife);
+		if (life2 < m_lastLife[1]) m_blockFor = 40;   // just got hit
+		else if (m_blockFor > 0) m_blockFor--;
+		Refill(m_lastLife, m_still);
 	}
 	for (int p = 0; p < 2; p++) {
 		uint16_t v = used[p] & ~(GUASA_START | GUASA_COIN);

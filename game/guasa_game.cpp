@@ -517,16 +517,17 @@ static int Play(const char* roms, bool test, const std::string& shots = "")
 				if (wins[0] + wins[1] == 1) shotAt = frame + 90, shotName = "versus-eligen";
 			}
 			g_overlay = [&](const SDL_FRect& r) {
-				// the counter at the bottom middle, between the super meters: nothing of the game there
+				// the counter at the top middle, in the gap between the score line and the
+				// K.O. of the life bars: nothing of the game there
 				float s = r.h / 450 > 1 ? r.h / 450 : 1;
 				char line[80];
 				snprintf(line, sizeof(line), "J1  %d - %d  J2", wins[0], wins[1]);
 				float w = (float)strlen(line) * 8 * s + 16 * s;
 				SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
 				SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 160);
-				SDL_FRect bar{ r.x + r.w / 2 - w / 2, r.y + r.h - 16 * s, w, 14 * s };
+				SDL_FRect bar{ r.x + r.w / 2 - w / 2, r.y + 29 * s, w, 12 * s };
 				SDL_RenderFillRect(g_ren, &bar);
-				Text(bar.x + 8 * s, bar.y + 3 * s, s, line, 235, 235, 235);
+				Text(bar.x + 8 * s, bar.y + 2 * s, s, line, 235, 235, 235);
 				if (frame < 600) Text(r.x + 6 * s, r.y + r.h - 13 * s, s, "Esc: salir", 200, 200, 200);
 				if (backIn) {   // who won, until both go back to pick
 					char who[48];
@@ -1551,7 +1552,7 @@ static void PracticeOptions(Practice& P, bool save)
 {
 	struct { const char* name; int* i; bool* b; } opts[] = {
 		{ "rival", &P.stance, NULL }, { "delay", &P.delay, NULL }, { "vida", NULL, &P.refillLife }, { "reloj", NULL, &P.freezeClock },
-		{ "super", NULL, &P.fullSuper }, { "historial", NULL, &P.showHistory }, { "medidor", NULL, &P.showFrames },
+		{ "historial", NULL, &P.showHistory }, { "medidor", NULL, &P.showFrames },
 		{ "cajas", NULL, &P.showBoxes }, { "empuje", NULL, &P.showPush }, { "combos", NULL, &P.showCombo },
 		{ "levantarse", &P.onWake, NULL }, { "bloquear", &P.onBlock, NULL },
 	};
@@ -1634,7 +1635,6 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 			Header("AYUDAS"),
 			item("Vida que se recupera", yesNo(P.refillLife), "", [&](int) { P.refillLife = !P.refillLife; }),
 			item("Tiempo infinito", yesNo(P.freezeClock), "", [&](int) { P.freezeClock = !P.freezeClock; }),
-			item("Super siempre llena", yesNo(P.fullSuper), "", [&](int) { P.fullSuper = !P.fullSuper; }),
 			item("Delay como en linea", std::to_string(P.delay), "F9", [&](int d) { P.delay = (P.delay + d + 6) % 6; }),
 			Header("PANTALLA"),
 			item("Historial de botones", yesNo(P.showHistory), "F2", [&](int) { P.showHistory = !P.showHistory; }),
@@ -1771,6 +1771,8 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 	CloseAll();
 	return 0;
 }
+
+
 
 
 // practica-prueba: the practice mode's own checks, without a window. One line
@@ -2005,7 +2007,8 @@ static int PracticeSelfTest(const char* roms)
 	const std::vector<std::pair<int, uint16_t>> sweep = { { 4, GUASA_DOWN | GUASA_HK } }, heavy = { { 3, GUASA_HP } };
 	P.onWake = kReactHeavy;
 	auto r1 = watch(sweep, kStand);
-	check(r1.first == 1 && r1.second == 0x0A, "reversal: al levantarse, golpe fuerte en el primer cuadro libre", said(r1));
+	// a normal: the game lets it out one frame after the first free one (specials and jumps, on it)
+	check(r1.first == 2 && r1.second == 0x0A, "reversal: al levantarse, golpe fuerte lo antes que deja el juego", said(r1));
 	P.onWake = kReactJumpBack;
 	auto r2 = watch(sweep, kStand);
 	check(r2.first == 1 && r2.second == 0x04, "reversal: al levantarse, salta atras en el primer cuadro libre", said(r2));
@@ -2025,6 +2028,22 @@ static int PracticeSelfTest(const char* roms)
 	P.onBlock = kReactNothing;
 	auto r5 = watch(sweep, kStand);
 	check(r5.first < 0, "reversal: en «nada», el rival no hace nada", said(r5));
+
+	// the super meter is always full: Ryu's super comes out (its fireball hits several
+	// times; a hadoken, once), and again right after
+	check(guasa_read_ram(kP1 + kSuper) == kFullSuper && guasa_read_ram(kP2 + kSuper) == kFullSuper, "la super esta llena");
+	auto superHits = [&] {
+		P.LoadPosition();
+		P.stance = kStand;
+		P.combo.Reset();
+		P.combo.hits = 0;
+		const uint16_t motion[] = { GUASA_DOWN, GUASA_DOWN | GUASA_RIGHT, GUASA_RIGHT, GUASA_DOWN, GUASA_DOWN | GUASA_RIGHT, GUASA_RIGHT | GUASA_LP };
+		for (uint16_t x : motion) run(2, x);
+		run(150, 0);
+		return P.combo.hits;
+	};
+	int s1 = superHits(), s2 = superHits();
+	check(s1 >= 3 && s2 >= 3, "la super sale siempre (su bola de fuego pega varias veces)", std::to_string(s1) + " y " + std::to_string(s2) + " golpes");
 	guasa_exit();
 	return fails ? 1 : 0;
 }
