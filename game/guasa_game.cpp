@@ -4,6 +4,7 @@
 //   guasa-game check <roms>      checks the ROM folder, one line per problem
 //   guasa-game versus <roms> [captura=<dir>]  two players on this PC: after each match both
 //                                pick again, with a win counter (nothing is recorded)
+//   guasa-game sonido-reto <roms> <out.wav>  the "new challenger" sound, from the player's ROM
 //   guasa-game arcade <roms> [captura=<dir>]  the machine as it is, from power-on: coins, the
 //                                cabinet's service menu (F2) and service credit (9); no savestates
 //   guasa-game test <roms>       Test Game: versus plus both players' buttons on screen,
@@ -1759,6 +1760,54 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 
 
 
+
+// sonido-reto <roms> <out.wav>: the arcade's "Here comes a new challenger!" sound,
+// from the player's own ROM and on their PC (nothing of the game comes with the
+// app): from power-on, a coin and start for player 1, a fight against the CPU,
+// and player 2 joins. The game cuts the music and plays it (found comparing the
+// sound with and without player 2 joining): its 2.3 seconds go to a WAV, which
+// the app plays when a challenge arrives. No window; about a second.
+static int ChallengerSound(const char* roms, const char* out)
+{
+	char msg[300] = "";
+	if (guasa_init(roms, msg, sizeof(msg))) { printf("error: %s\n", msg); return 1; }
+	const int join = 3200, from = join + 2, len = 138;   // player 2's start, and the frames of the sound
+	std::vector<int16_t> pcm;
+	for (int f = 0; f < from + len; f++) {
+		uint16_t in[2] = { 0, 0 };
+		if (f >= 1500 && f < 1506) in[0] = GUASA_COIN;
+		if (f >= 1600 && f < 1606) in[0] = GUASA_START;
+		if (f >= 2000 && f < 2006) in[0] = GUASA_LP;   // Ryu, and the fight starts
+		if (f >= join - 80 && f < join - 74) in[1] = GUASA_COIN;
+		if (f >= join && f < join + 6) in[1] = GUASA_START;
+		guasa_run_frame(in, 0);
+		if (f >= from) { int n = 0; const int16_t* a = guasa_audio(&n); pcm.insert(pcm.end(), a, a + n * 2); }
+	}
+	guasa_exit();
+	// a short fade at the end, so it doesn't click
+	size_t fade = SDL_min(pcm.size() / 2, (size_t)GUASA_SOUND_RATE / 10);
+	for (size_t k = 0; k < fade; k++)
+		for (int c = 0; c < 2; c++) {
+			int16_t& v = pcm[pcm.size() - 2 * (fade - k) + c];
+			v = (int16_t)(v * (double)(fade - k) / fade);
+		}
+	double sum = 0;
+	for (int16_t v : pcm) sum += (double)v * v;
+	if (pcm.empty() || SDL_sqrt(sum / pcm.size()) < 200) { printf("error: no se oyo nada\n"); return 1; }   // silence: something went wrong
+	FILE* f = fopen(out, "wb");
+	if (!f) { printf("error: no pude escribir %s\n", out); return 1; }
+	uint32_t data = (uint32_t)pcm.size() * 2, rate = GUASA_SOUND_RATE;
+	auto u32 = [&](uint32_t v) { fwrite(&v, 4, 1, f); };
+	auto u16 = [&](uint16_t v) { fwrite(&v, 2, 1, f); };
+	fwrite("RIFF", 1, 4, f); u32(36 + data); fwrite("WAVEfmt ", 1, 8, f);
+	u32(16); u16(1); u16(2); u32(rate); u32(rate * 4); u16(4); u16(16);
+	fwrite("data", 1, 4, f); u32(data);
+	fwrite(pcm.data(), 2, pcm.size(), f);
+	fclose(f);
+	printf("listo\n");
+	return 0;
+}
+
 // practica-prueba: the practice mode's own checks, without a window. One line
 // per check (PASA / FALLA); exit code 0 only if all pass.
 static int PracticeSelfTest(const char* roms)
@@ -2361,6 +2410,7 @@ int main(int argc, char** argv)
 		return PlayPractice(argv[2], shots, stage);
 	}
 	if (mode == "practica-prueba") return PracticeSelfTest(argv[2]);
+	if (mode == "sonido-reto" && argc >= 4) return ChallengerSound(argv[2], argv[3]);
 	if (mode == "espectar") {
 		bool pause = false;
 		std::string shots;
