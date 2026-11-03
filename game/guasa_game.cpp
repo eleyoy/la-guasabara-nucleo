@@ -30,9 +30,8 @@
 // and "voz rival" for F7 and F8, "mensaje <text>" for a message to the rival (T);
 // on stdin "salir" closes the window (the set is over), "voz estado mic=on|off
 // rival=on|off|nada" updates the voice indicator, "mensaje <name>\t<text>"
-// shows a message (":id:" is one of the league's emojis), "rapido <0-9> <text>"
-// sets what keys 1 to 0 send (0 = key 1 ... 9 = key 0) and "jugador <0|1>
-// <rank|-> <name>" names each side, with its rank's badge.
+// shows a message (":id:" is one of the league's emojis, a sticker: one every 10
+// seconds) and "jugador <0|1> <rank|-> <name>" names each side, with its rank's badge.
 // Every match starts from the starting state generated here (guasa_boot_to_select),
 // and the window keeps the game's own pace, 59.63 frames per second.
 
@@ -809,18 +808,6 @@ static void DrawNames(const SDL_FRect& r)
 	}
 }
 
-// Keys 1 to 0: quick messages, as the app says (chosen in Mi perfil).
-static std::mutex g_quickLock;
-static std::string g_quick[10];
-
-// The quick slot of a key: top-row 1..0 (unless it's a game button) or the keypad's; -1 none.
-static int QuickSlot(SDL_Scancode sc)
-{
-	if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_0) return KeyIsButton(sc) ? -1 : sc - SDL_SCANCODE_1;
-	if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_0) return sc - SDL_SCANCODE_KP_1;
-	return -1;
-}
-
 struct ShownMessage { std::string from, text; Uint64 at; int side; };   // side: 0 player 1, 1 player 2
 
 // The last messages, each for 6 seconds, on the side of who wrote it: player 1's
@@ -902,7 +889,7 @@ struct MessagePanel {
 				Text(it.x + 6 * s, it.y + 7 * s, s, t.c_str(), c, c, c);
 			}
 		}
-		Text(L.box.x + 10 * s, L.box.y + L.box.h - 18 * s, s, "Sin abrir esto: teclas 1 a 0 = mensajes rapidos (Mi perfil)", 170, 170, 170);
+		Text(L.box.x + 10 * s, L.box.y + L.box.h - 18 * s, s, "Un sticker cada 10 segundos", 170, 170, 170);
 	}
 };
 
@@ -950,10 +937,6 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 					g_ranks[line[8] - '0'] = rank == "-" ? "" : rank;
 					g_names[line[8] - '0'] = line.substr(sp + 1);
 				}
-			}
-			if (line.rfind("rapido ", 0) == 0 && line.size() > 8 && line[7] >= '0' && line[7] <= '9') {   // "rapido <n> <text>"
-				std::lock_guard<std::mutex> lock(g_quickLock);
-				g_quick[line[7] - '0'] = line.size() > 9 ? line.substr(9) : "";
 			}
 			if (line.rfind("mensaje ", 0) == 0) {   // "mensaje <name>\t<text>"
 				size_t tab = line.find('\t', 8);
@@ -1004,11 +987,23 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 		panel.typed.clear();
 		if (open) SDL_StartTextInput(g_win); else SDL_StopTextInput(g_win);
 	};
+	Uint64 stickerAt = 0;   // one sticker every 10 seconds, against spam (the hub keeps the same rule)
 	auto sendMessage = [&](const std::string& text) {
 		std::string clean;
 		for (char c : text) if (c != '\n' && c != '\r') clean += c;
 		if (clean.empty()) return;
 		clean = clean.substr(0, 120);
+		bool sticker = false;
+		for (const char* e : kEmojis) sticker |= clean.find(std::string(":") + e + ":") != std::string::npos;
+		if (sticker) {
+			Uint64 now = SDL_GetTicksNS();
+			if (stickerAt && now - stickerAt < 10000000000ULL) {
+				note = "Un sticker cada 10 segundos";
+				noteAt = now;
+				return;
+			}
+			stickerAt = now;
+		}
 		printf("mensaje %s\n", clean.c_str());
 		fflush(stdout);
 		shownMsgs.push_back({ "Tu", clean, SDL_GetTicksNS(), cfg.local });
@@ -1067,17 +1062,6 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 				case SDL_SCANCODE_F4: openPanel(true); break;
 				case SDL_SCANCODE_P: if (!KeyIsButton(SDL_SCANCODE_P)) askPause(); break;
 				case SDL_SCANCODE_F3: case SDL_SCANCODE_PAUSE: askPause(); break;
-				case SDL_SCANCODE_1: case SDL_SCANCODE_2: case SDL_SCANCODE_3: case SDL_SCANCODE_4: case SDL_SCANCODE_5:
-				case SDL_SCANCODE_6: case SDL_SCANCODE_7: case SDL_SCANCODE_8: case SDL_SCANCODE_9: case SDL_SCANCODE_0:
-				case SDL_SCANCODE_KP_1: case SDL_SCANCODE_KP_2: case SDL_SCANCODE_KP_3: case SDL_SCANCODE_KP_4: case SDL_SCANCODE_KP_5:
-				case SDL_SCANCODE_KP_6: case SDL_SCANCODE_KP_7: case SDL_SCANCODE_KP_8: case SDL_SCANCODE_KP_9: case SDL_SCANCODE_KP_0:
-					if (!ev.key.repeat) {   // a quick message: sent at once
-						int slot = QuickSlot(ev.key.scancode);
-						std::string text;
-						if (slot >= 0) { std::lock_guard<std::mutex> lock(g_quickLock); text = g_quick[slot]; }
-						if (!text.empty()) sendMessage(text);
-					}
-					break;
 				case SDL_SCANCODE_F1: StartCapture(); break;
 				case SDL_SCANCODE_F2: showInputs = !showInputs; break;
 				case SDL_SCANCODE_F5: net.SetDelay(net.Stats().delay - 1); break;
