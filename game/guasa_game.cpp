@@ -62,10 +62,21 @@
 // ---------------------------------------------------------------------------
 // Controls. A device (the keyboard or a joystick) has one bind per action.
 
-enum { kActions = 12 };
+// The last two are x3: one input that presses the three punches (or the three
+// kicks) at once. A set where a player turns them down plays without them.
+enum { kActions = 14 };
 static const char* kActionNames[kActions] = { "ARRIBA", "ABAJO", "IZQUIERDA", "DERECHA", "PUNO DEBIL",
-	"PUNO MEDIO", "PUNO FUERTE", "PATADA DEBIL", "PATADA MEDIA", "PATADA FUERTE", "START", "MONEDA" };
-static const char* kShort[kActions] = { "Ar", "Ab", "Iz", "De", "LP", "MP", "HP", "LK", "MK", "HK", "St", "Mo" };
+	"PUNO MEDIO", "PUNO FUERTE", "PATADA DEBIL", "PATADA MEDIA", "PATADA FUERTE", "START", "MONEDA", "X3 PUNOS", "X3 PATADAS" };
+static const char* kShort[kActions] = { "Ar", "Ab", "Iz", "De", "LP", "MP", "HP", "LK", "MK", "HK", "St", "Mo", "3P", "3K" };
+static bool g_noX3 = false;   // "sinx3": in this set the x3 inputs do nothing
+
+// The game's buttons an action presses.
+static uint16_t ActionBits(int a)
+{
+	if (a == 12) return g_noX3 ? 0 : GUASA_LP | GUASA_MP | GUASA_HP;
+	if (a == 13) return g_noX3 ? 0 : GUASA_LK | GUASA_MK | GUASA_HK;
+	return (uint16_t)(1 << a);
+}
 
 struct Bind { char kind; int index, value, rest; };   // 'k' key, 'b' button, 'h' hat, 'a' axis, 0 none
 struct Mapping { std::string name; Bind b[kActions]; };
@@ -127,9 +138,9 @@ static Mapping KeyboardDefault()
 {
 	static const SDL_Scancode k[kActions] = { SDL_SCANCODE_UP, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT,
 		SDL_SCANCODE_A, SDL_SCANCODE_S, SDL_SCANCODE_D, SDL_SCANCODE_Z, SDL_SCANCODE_X, SDL_SCANCODE_C,
-		SDL_SCANCODE_RETURN, SDL_SCANCODE_5 };
+		SDL_SCANCODE_RETURN, SDL_SCANCODE_5, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN };
 	Mapping m{ "Teclado", {} };
-	for (int i = 0; i < kActions; i++) m.b[i] = { 'k', (int)k[i], 1, 0 };
+	for (int i = 0; i < kActions; i++) m.b[i] = k[i] ? Bind{ 'k', (int)k[i], 1, 0 } : Bind{ 0, 0, 0, 0 };   // x3: none
 	return m;
 }
 
@@ -196,7 +207,7 @@ static uint16_t GamepadDefault(SDL_Gamepad* g)
 	static const SDL_GamepadButton buttons[kActions] = { SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN,
 		SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH,
 		SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_INVALID,
-		SDL_GAMEPAD_BUTTON_START, SDL_GAMEPAD_BUTTON_BACK };
+		SDL_GAMEPAD_BUTTON_START, SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_BUTTON_INVALID };
 	uint16_t in = 0;
 	for (int i = 0; i < kActions; i++)
 		if (buttons[i] != SDL_GAMEPAD_BUTTON_INVALID && SDL_GetGamepadButton(g, buttons[i])) in |= 1 << i;
@@ -214,7 +225,7 @@ static uint16_t ReadDevice(const Device& d)
 	auto m = g_maps.find(d.id);
 	if (m == g_maps.end()) return d.pad ? GamepadDefault(d.pad) : 0;
 	uint16_t in = 0;
-	for (int i = 0; i < kActions; i++) if (BindDown(&d, m->second.b[i])) in |= 1 << i;
+	for (int i = 0; i < kActions; i++) if (BindDown(&d, m->second.b[i])) in |= ActionBits(i);
 	return in;
 }
 
@@ -228,7 +239,7 @@ static void ReadPlayers(uint16_t in[2], bool keyboard = true)
 	const Mapping& keys = k != g_maps.end() ? k->second : KeyboardDefault();
 	in[0] = in[1] = 0;
 	if (keyboard)
-		for (int i = 0; i < kActions; i++) if (BindDown(NULL, keys.b[i])) in[0] |= 1 << i;
+		for (int i = 0; i < kActions; i++) if (BindDown(NULL, keys.b[i])) in[0] |= ActionBits(i);
 	for (size_t p = 0; p < g_devs.size() && p < 2; p++) in[p] |= ReadDevice(g_devs[p]);
 }
 
@@ -314,6 +325,343 @@ static void DrawInputs(const SDL_FRect& r, const uint16_t raw[2])
 
 static void DrawStats(const NetStats& st, int local);
 
+// ---------------------------------------------------------------------------
+// guasa-game controles: setting up a control on a picture of the La Guasabara
+// cabinet's panel (player 1's side, arte-app/controles), one action at a time and
+// in any order: a click on a piece of it, or on the list next to it (or Enter),
+// waits for the input that goes there. The same panel opens with F1 inside any
+// game window (on top of the game, which gets no buttons meanwhile). Which device: the
+// arrows at the top, or press anything on it. What's pressed lights up, so it
+// can be tried right there. Each change is saved at once (controles.txt).
+
+static SDL_Texture* ControlTexture(const char* name)
+{
+	static std::map<std::string, SDL_Texture*> cache;
+	auto it = cache.find(name);
+	if (it != cache.end()) return it->second;
+	SDL_Texture* t = NULL;
+	if (SDL_Surface* sf = SDL_LoadPNG((std::string(SDL_GetBasePath()) + "controles/" + name + ".png").c_str())) {
+		t = SDL_CreateTextureFromSurface(g_ren, sf);
+		SDL_DestroySurface(sf);
+	}
+	cache[name] = t;
+	return t;
+}
+
+// What a bind is, in a few words.
+static std::string BindText(const Bind& b)
+{
+	char s[64];
+	switch (b.kind) {
+	case 'k': snprintf(s, sizeof(s), "Tecla %s", SDL_GetScancodeName((SDL_Scancode)b.index)); break;
+	case 'b': snprintf(s, sizeof(s), "Boton %d", b.index + 1); break;
+	case 'h': snprintf(s, sizeof(s), "Cruceta %s", b.value == SDL_HAT_UP ? "arriba" : b.value == SDL_HAT_DOWN ? "abajo" :
+	                   b.value == SDL_HAT_LEFT ? "izquierda" : b.value == SDL_HAT_RIGHT ? "derecha" : "?"); break;
+	case 'a': snprintf(s, sizeof(s), "Eje %d %s", b.index + 1, b.value > 0 ? "+" : "-"); break;
+	default: return "(sin asignar)";
+	}
+	return s;
+}
+
+// A gamepad without a setup works with GamepadDefault; to change it one bind at
+// a time, those defaults are written as the joystick's own inputs.
+static Mapping MappingFromGamepad(SDL_Gamepad* g, const std::string& name)
+{
+	static const SDL_GamepadButton want[kActions] = { SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+		SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH,
+		SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_INVALID,
+		SDL_GAMEPAD_BUTTON_START, SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_BUTTON_INVALID };
+	Mapping m{ name, {} };
+	int n = 0;
+	SDL_GamepadBinding** binds = SDL_GetGamepadBindings(g, &n);
+	for (int a = 0; a < kActions; a++)
+		for (int i = 0; i < n; i++) {
+			const SDL_GamepadBinding& gb = *binds[i];
+			bool hit = a == 9 ? gb.output_type == SDL_GAMEPAD_BINDTYPE_AXIS && gb.output.axis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER   // heavy kick: RT
+			                  : want[a] != SDL_GAMEPAD_BUTTON_INVALID && gb.output_type == SDL_GAMEPAD_BINDTYPE_BUTTON && gb.output.button == want[a];
+			if (!hit) continue;
+			if (gb.input_type == SDL_GAMEPAD_BINDTYPE_BUTTON) m.b[a] = { 'b', gb.input.button, 1, 0 };
+			else if (gb.input_type == SDL_GAMEPAD_BINDTYPE_HAT) m.b[a] = { 'h', gb.input.hat.hat, gb.input.hat.hat_mask, 0 };
+			else if (gb.input_type == SDL_GAMEPAD_BINDTYPE_AXIS) m.b[a] = { 'a', gb.input.axis.axis, gb.input.axis.axis_max > 0 ? 1 : -1, 0 };
+			break;
+		}
+	SDL_free(binds);
+	return m;
+}
+
+
+// The controls panel: state, events and drawing. Drawn at 1000 x 660 and scaled
+// to the window (its own logical size while it draws or reads the mouse).
+struct ControlsPanel {
+	bool open = false;
+	std::string devId = "teclado", devName = "Teclado";
+	Mapping cur;
+	int focus = 4, listen = -1, heldAxis = -1;
+	bool guided = false;   // "paso a paso", like the old setup: every action in order, one after the other
+	float mx = -1, my = -1;
+	std::string note;
+	Uint64 noteAt = 0;
+	static constexpr float W = 1000, H = 660;
+	// The panel (player 1's side of the La Guasabara cabinet, 515 x 340), and
+	// where each piece is on it: the stick's four ways are small arrows around
+	// it, the buttons and start are circles (found on the picture)
+	static constexpr float panelW = 515, panelH = 340, k = 470 / panelH, px0 = 24, py0 = 120;
+	struct Spot { SDL_FPoint c; float r; bool round; float h = 0; };   // h: a box's half height, if not square
+	Spot spots[kActions];
+	float listX = 0, listW = 0;
+	static constexpr float rowH = 470.0f / kActions, listY = 120;
+	SDL_FRect prev{ 152, 66, 34, 30 }, next{ 560, 66, 34, 30 }, steps{ 464, 606, 160, 38 }, reset{ 640, 606, 160, 38 }, done{ 816, 606, 160, 38 };
+
+	ControlsPanel()
+	{
+		auto at = [](float x, float y) { return SDL_FPoint{ px0 + x * k, py0 + y * k }; };
+		const float stickX = 118, stickY = 188, arm = 60, arrow = 15;
+		Spot all[kActions] = {
+			{ at(stickX, stickY - arm), arrow * k, false }, { at(stickX, stickY + arm), arrow * k, false },
+			{ at(stickX - arm, stickY), arrow * k, false }, { at(stickX + arm, stickY), arrow * k, false },
+			{ at(227, 166), 41 * k, true }, { at(317, 164), 41 * k, true }, { at(410, 166), 41 * k, true },
+			{ at(224, 262), 41 * k, true }, { at(316, 255), 41 * k, true }, { at(409, 257), 41 * k, true },
+			{ at(428, 44), 39 * k, true },
+			{ at(471, 311), 43 * k, false, 28 * k },   // coin: the panel has none, so a box in its free corner
+			{ at(58, 26), 40 * k, false, 14 * k },     // x3: two boxes in the empty top left
+			{ at(58, 62), 40 * k, false, 14 * k },
+		};
+		for (int a = 0; a < kActions; a++) spots[a] = all[a];
+		listX = px0 + panelW * k + 16;
+		listW = W - 24 - listX;
+	}
+	Device* device() { for (auto& d : g_devs) if (d.id == devId) return &d; return NULL; }
+	void pick(const std::string& id)
+	{
+		devId = id;
+		Device* d = device();
+		devName = d ? d->name : "Teclado";
+		auto m = g_maps.find(id);
+		cur = m != g_maps.end() ? m->second : id == "teclado" ? KeyboardDefault() : d && d->pad ? MappingFromGamepad(d->pad, devName) : Mapping{ devName, {} };
+	}
+	void Open() { pick(g_devs.empty() ? "teclado" : g_devs[0].id); listen = -1; guided = false; open = true; }
+	// after an action (assigned or skipped): in "paso a paso", on to the next one
+	void advance(int was)
+	{
+		listen = -1;
+		if (!guided) return;
+		if (was + 1 < kActions) { listen = focus = was + 1; heldAxis = -1; }
+		else { guided = false; say("Listo: " + devName + " configurado"); }
+	}
+	void save() { cur.name = devName; g_maps[devId] = cur; SaveMaps(); printf("control configurado: %s\n", devName.c_str()); fflush(stdout); }
+	void say(const std::string& t) { note = t; noteAt = SDL_GetTicksNS(); }
+	SDL_FRect row(int a) const { return SDL_FRect{ listX, listY + a * rowH + 3, listW, rowH - 3 }; }
+	static bool inside(const SDL_FRect& r, float x, float y) { return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h; }
+	int spotAt(float x, float y) const
+	{
+		for (int a = 0; a < kActions; a++) {
+			if (inside(row(a), x, y)) return a;
+			const Spot& sp = spots[a];
+			float dx = x - sp.c.x, dy = y - sp.c.y;
+			if (sp.round ? dx * dx + dy * dy <= sp.r * sp.r : SDL_fabsf(dx) <= sp.r && SDL_fabsf(dy) <= (sp.h ? sp.h : sp.r)) return a;
+		}
+		return -1;
+	}
+	void assign(const Bind& b)
+	{
+		for (int j = 0; j < kActions; j++)   // the same input somewhere else: it moves here
+			if (j != listen && cur.b[j].kind == b.kind && cur.b[j].index == b.index && cur.b[j].value == b.value) cur.b[j] = Bind{ 0, 0, 0, 0 };
+		cur.b[listen] = b;
+		save();
+		say(std::string(kActionNames[listen]) + ": " + BindText(b));
+		advance(listen);
+	}
+	void step(int d)
+	{
+		std::vector<std::string> ids{ "teclado" };
+		for (auto& dv : g_devs) ids.push_back(dv.id);
+		size_t i = 0;
+		while (i < ids.size() && ids[i] != devId) i++;
+		pick(ids[(i + ids.size() + d) % ids.size()]);
+		listen = -1;
+		guided = false;
+	}
+
+	// While open it takes every event but quitting and controls coming and going
+	// (the caller still handles those). False when closed.
+	bool Event(const SDL_Event& in)
+	{
+		if (!open) return false;
+		if (in.type == SDL_EVENT_QUIT || in.type == SDL_EVENT_JOYSTICK_ADDED) return false;
+		if (in.type == SDL_EVENT_JOYSTICK_REMOVED) return false;
+		SDL_Event ev = in;
+		int lw, lh;
+		SDL_RendererLogicalPresentation mode;
+		SDL_GetRenderLogicalPresentation(g_ren, &lw, &lh, &mode);
+		SDL_SetRenderLogicalPresentation(g_ren, (int)W, (int)H, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+		SDL_ConvertEventToRenderCoordinates(g_ren, &ev);
+		SDL_SetRenderLogicalPresentation(g_ren, lw, lh, mode);
+		if (ev.type == SDL_EVENT_MOUSE_MOTION) { mx = ev.motion.x; my = ev.motion.y; }
+		// which device sent it (empty: none of the joysticks)
+		std::string from;
+		SDL_JoystickID which = ev.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN ? ev.jbutton.which : ev.type == SDL_EVENT_JOYSTICK_HAT_MOTION ? ev.jhat.which
+		                     : ev.type == SDL_EVENT_JOYSTICK_AXIS_MOTION ? ev.jaxis.which : 0;
+		if (which) for (auto& d : g_devs) if (SDL_GetJoystickID(d.joy) == which) from = d.id;
+		if (listen >= 0) {
+			if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.scancode == SDL_SCANCODE_ESCAPE) {
+				if (guided) advance(listen);   // paso a paso: Esc leaves this one as it is and goes on
+				else { listen = -1; say("Cancelado"); }
+				return true;
+			}
+			if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) { listen = -1; guided = false; return true; }
+			if (devId == "teclado") {
+				if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) assign(Bind{ 'k', (int)ev.key.scancode, 1, 0 });
+				return true;
+			}
+			if (from != devId) return true;
+			Device* d = device();
+			if (ev.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN) assign(Bind{ 'b', ev.jbutton.button, 1, 0 });
+			else if (ev.type == SDL_EVENT_JOYSTICK_HAT_MOTION && ev.jhat.value) {
+				// one direction even if a diagonal comes first; for a direction, the one asked for
+				Uint8 v = ev.jhat.value, want = listen == 0 ? SDL_HAT_UP : listen == 1 ? SDL_HAT_DOWN : listen == 2 ? SDL_HAT_LEFT : listen == 3 ? SDL_HAT_RIGHT : 0;
+				if (want && !(v & want)) return true;
+				if (!want) want = (v & SDL_HAT_UP) ? SDL_HAT_UP : (v & SDL_HAT_DOWN) ? SDL_HAT_DOWN : (v & SDL_HAT_LEFT) ? SDL_HAT_LEFT : SDL_HAT_RIGHT;
+				assign(Bind{ 'h', ev.jhat.hat, want, 0 });
+			} else if (ev.type == SDL_EVENT_JOYSTICK_AXIS_MOTION && d) {
+				int rest = ev.jaxis.axis < (int)d->rest.size() ? d->rest[ev.jaxis.axis] : 0, v = ev.jaxis.value - rest;
+				if (ev.jaxis.axis == heldAxis) { if (abs(v) < 8000) heldAxis = -1; return true; }
+				if (abs(v) > 16000) { heldAxis = ev.jaxis.axis; assign(Bind{ 'a', ev.jaxis.axis, v > 0 ? 1 : -1, rest }); }
+			}
+			return true;
+		}
+		// not waiting for an input: a press on another control picks that control
+		if (!from.empty() && from != devId && (ev.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN || (ev.type == SDL_EVENT_JOYSTICK_HAT_MOTION && ev.jhat.value))) {
+			pick(from);
+			say("Configurando: " + devName);
+		}
+		if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) {
+			switch (ev.key.scancode) {
+			case SDL_SCANCODE_ESCAPE: case SDL_SCANCODE_F1: open = false; break;
+			case SDL_SCANCODE_F2: guided = true; listen = focus = 0; heldAxis = -1; break;
+			case SDL_SCANCODE_TAB: case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_DOWN: focus = (focus + 1) % kActions; break;
+			case SDL_SCANCODE_LEFT: case SDL_SCANCODE_UP: focus = (focus + kActions - 1) % kActions; break;
+			case SDL_SCANCODE_RETURN: case SDL_SCANCODE_SPACE: listen = focus; heldAxis = -1; break;
+			case SDL_SCANCODE_DELETE: case SDL_SCANCODE_BACKSPACE: cur.b[focus] = Bind{ 0, 0, 0, 0 }; save(); say(std::string(kActionNames[focus]) + ": sin asignar"); break;
+			case SDL_SCANCODE_PAGEUP: step(-1); break;
+			case SDL_SCANCODE_PAGEDOWN: step(1); break;
+			default: break;
+			}
+		}
+		if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_LEFT) {
+			float x = ev.button.x, y = ev.button.y;
+			int a = spotAt(x, y);
+			if (a >= 0) { focus = listen = a; heldAxis = -1; }
+			else if (inside(prev, x, y)) step(-1);
+			else if (inside(next, x, y)) step(1);
+			else if (inside(done, x, y)) open = false;
+			else if (inside(steps, x, y)) { guided = true; listen = focus = 0; heldAxis = -1; }
+			else if (inside(reset, x, y)) {
+				g_maps.erase(devId);
+				SaveMaps();
+				pick(devId);
+				say("Como venia de fabrica");
+			}
+		}
+		return true;
+	}
+
+	void Draw()
+	{
+		if (!open) return;
+		if (devId != "teclado" && !device()) pick("teclado");   // its control went away
+		int lw, lh;
+		SDL_RendererLogicalPresentation mode;
+		SDL_GetRenderLogicalPresentation(g_ren, &lw, &lh, &mode);
+		SDL_SetRenderLogicalPresentation(g_ren, (int)W, (int)H, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+		// what's pressed now on the device being set up
+		Device* d = device();
+		bool down[kActions];
+		for (int a = 0; a < kActions; a++) down[a] = (devId == "teclado" || d) && BindDown(d, cur.b[a]);
+		bool blink = (SDL_GetTicks() / 250) % 2;
+		int hover = spotAt(mx, my);
+		const char* color[6] = { "rojo", "blanco", "azul", "rojo", "blanco", "azul" };
+		const char* arrows[4] = { "^", "v", "<", ">" };
+
+		SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+		SDL_SetRenderDrawColor(g_ren, 13, 14, 19, 240);   // over the game, if there is one
+		SDL_FRect all{ 0, 0, W, H };
+		SDL_RenderFillRect(g_ren, &all);
+		Text(24, 20, 3, "CONTROLES", 255, 46, 136);
+		Text(300, 28, 1.5f, "Haz clic en una pieza y aprieta lo que va ahi", 200, 200, 210);
+		// the device, with arrows to change it
+		Text(24, 74, 1.75f, "Control:", 200, 200, 210);
+		for (const SDL_FRect* r : { &prev, &next }) {
+			SDL_SetRenderDrawColor(g_ren, 40, 42, 54, 255);
+			SDL_RenderFillRect(g_ren, r);
+			Text(r->x + 11, r->y + 8, 1.75f, r == &prev ? "<" : ">", 255, 255, 255);
+		}
+		std::string shown = devName.substr(0, 40);
+		Text(prev.x + 46, 74, 1.75f, shown.c_str(), 255, 220, 120);
+		Text(next.x + 48, 76, 1.25f, "o aprieta algo en ese control", 150, 150, 160);
+		// the panel, and on it what's pressed and what's chosen
+		if (SDL_Texture* t = ControlTexture("panel")) { SDL_FRect r{ px0, py0, panelW * k, panelH * k }; SDL_RenderTexture(g_ren, t, NULL, &r); }
+		for (int a = 0; a < kActions; a++) {
+			const Spot& sp = spots[a];
+			bool wait = a == listen, on = a == focus || a == hover;
+			float hh = sp.h ? sp.h : sp.r;
+			SDL_FRect r{ sp.c.x - sp.r, sp.c.y - hh, 2 * sp.r, 2 * hh };
+			if (sp.round) {
+				if (down[a]) {   // pressed: the button pressed, on top of the panel's
+					std::string name = std::string("boton-") + (a < 10 ? color[a - 4] : "blanco") + "-apretado";
+					if (SDL_Texture* t = ControlTexture(name.c_str())) SDL_RenderTexture(g_ren, t, NULL, &r);
+				}
+			} else {   // a way of the stick (an arrow), the coin or x3: yellow while pressed
+				SDL_SetRenderDrawColor(g_ren, down[a] ? 255 : 0, down[a] ? 220 : 0, down[a] ? 60 : 0, down[a] ? 255 : a >= 11 ? 235 : 170);
+				SDL_RenderFillRect(g_ren, &r);
+				Uint8 c = down[a] ? 20 : 255;
+				if (a < 4) Text(sp.c.x - 8, sp.c.y - 8, 2, arrows[a], c, c, c);
+				else {
+					SDL_SetRenderDrawColor(g_ren, 212, 160, 60, 255);   // a golden edge, like the panel's labels
+					SDL_RenderRect(g_ren, &r);
+					const char* label = a == 11 ? "MONEDA" : a == 12 ? "X3 PUNOS" : "X3 PATADAS";
+					float ts = a == 11 ? 1.5f : 1.1f;
+					Text(sp.c.x - strlen(label) * 4 * ts, sp.c.y - 4 * ts, ts, label, down[a] ? 20 : 255, down[a] ? 20 : 220, down[a] ? 20 : 120);
+				}
+			}
+			if (wait || on) {   // chosen: a ring (pink and blinking while it waits for the input)
+				if (wait && !blink) continue;
+				SDL_SetRenderDrawColor(g_ren, 255, wait ? 46 : 220, wait ? 136 : 120, 255);
+				for (int t = 0; t < (wait ? 4 : 2); t++) { SDL_FRect o{ r.x - 4 - t, r.y - 4 - t, r.w + 8 + 2 * t, r.h + 8 + 2 * t }; SDL_RenderRect(g_ren, &o); }
+			}
+		}
+		// the list: every action, what it has, lit while pressed
+		for (int a = 0; a < kActions; a++) {
+			SDL_FRect r = row(a);
+			bool wait = a == listen, on = a == focus || a == hover;
+			SDL_SetRenderDrawColor(g_ren, down[a] ? 255 : 28, down[a] ? 220 : 30, down[a] ? 120 : 40, 255);
+			SDL_RenderFillRect(g_ren, &r);
+			if (wait ? blink : on) {
+				SDL_SetRenderDrawColor(g_ren, 255, wait ? 46 : 220, wait ? 136 : 120, 255);
+				SDL_RenderRect(g_ren, &r);
+			}
+			Uint8 c = down[a] ? 20 : 255;
+			Text(r.x + 8, r.y + 3, 1.25f, kActionNames[a], c, c, c);
+			std::string bind = wait ? "Aprieta..." : BindText(cur.b[a]);
+			Text(r.x + 8, r.y + 16, 1, bind.c_str(), down[a] ? 40 : wait ? 255 : 170, down[a] ? 40 : wait ? 120 : 190, down[a] ? 40 : wait ? 170 : 220);
+		}
+		// the bottom: what's happening, and the buttons
+		std::string line = listen >= 0 && guided ? std::string("PASO A PASO ") + std::to_string(listen + 1) + "/" + std::to_string(kActions) + ": aprieta " + kActionNames[listen] + " (Esc: saltar)"
+		                 : listen >= 0 ? std::string("Aprieta lo que va en ") + kActionNames[listen] + "  (Esc: cancelar)"
+		                 : note.size() && SDL_GetTicksNS() - noteAt < 4000000000ULL ? note.substr(0, 52)
+		                 : "Clic: asignar   Supr: vaciar   Esc: cerrar";
+		Text(24, 620, 1, line.c_str(), listen >= 0 ? 255 : 200, listen >= 0 ? 120 : 200, listen >= 0 ? 170 : 210);
+		for (const SDL_FRect* r : { &steps, &reset, &done }) {
+			bool h = inside(*r, mx, my) || (r == &steps && guided);
+			SDL_SetRenderDrawColor(g_ren, r == &done ? 255 : 40, r == &done ? 46 : 42, r == &done ? 136 : 54, h ? 255 : 220);
+			SDL_RenderFillRect(g_ren, r);
+			const char* t = r == &done ? "LISTO" : r == &reset ? "DE FABRICA" : "PASO A PASO";
+			Text(r->x + (r->w - strlen(t) * 12) / 2, r->y + 12, 1.5f, t, 255, 255, 255);
+		}
+		SDL_SetRenderLogicalPresentation(g_ren, lw, lh, mode);
+	}
+};
+static ControlsPanel g_ctl;   // F1 in any game window
+
 static std::function<void(const SDL_FRect&)> g_overlay;   // drawn last (messages in online sets)
 
 // show = false: drawn but not shown yet (a picture of it is taken first)
@@ -338,96 +686,10 @@ static void Present(const uint16_t* raw, const char* banner, const NetStats* sta
 		if (nl) Text(r.x + 12 * s, box.y + 50 * s, s, nl + 1);
 	}
 	if (g_overlay) g_overlay(r);
+	g_ctl.Draw();
 	if (show) SDL_RenderPresent(g_ren);
 }
 
-// ---------------------------------------------------------------------------
-// Setting up a control inside the window (F1). The first device that sends
-// anything is the one being set up; each action waits until the player
-// presses something, and Esc leaves it without a bind.
-
-struct Capture { bool active; int action; std::string id, name; Mapping m; std::vector<int> rest; int heldAxis; };
-static Capture g_cap;
-
-static void StartCapture()
-{
-	g_cap = Capture{ true, -1, "", "", {}, {}, -1 };
-}
-
-static bool Captured(const Bind& b)
-{
-	g_cap.m.b[g_cap.action] = b;
-	g_cap.action++;
-	if (g_cap.action == kActions) {
-		g_cap.m.name = g_cap.name;
-		g_maps[g_cap.id] = g_cap.m;
-		SaveMaps();
-		printf("control configurado: %s\n", g_cap.name.c_str());
-		fflush(stdout);
-		g_cap.active = false;
-	}
-	return true;
-}
-
-// Returns true if the event was used by the setup.
-static bool CaptureEvent(const SDL_Event& ev)
-{
-	if (!g_cap.active) return false;
-	if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_ESCAPE) {
-		if (g_cap.action < 0) { g_cap.active = false; return true; }   // cancel before starting
-		return Captured(Bind{ 0, 0, 0, 0 });
-	}
-	// which device: the first that sends something
-	if (g_cap.action < 0) {
-		if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) { g_cap.id = "teclado"; g_cap.name = "Teclado"; }
-		else if (ev.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN || ev.type == SDL_EVENT_JOYSTICK_HAT_MOTION) {
-			for (auto& d : g_devs)
-				if (SDL_GetJoystickID(d.joy) == (ev.type == SDL_EVENT_JOYSTICK_HAT_MOTION ? ev.jhat.which : ev.jbutton.which)) {
-					g_cap.id = d.id; g_cap.name = d.name; g_cap.rest = d.rest;
-				}
-		}
-		if (!g_cap.id.empty()) g_cap.action = 0;   // that press only picks the device
-		return ev.type == SDL_EVENT_KEY_DOWN || ev.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN;
-	}
-	bool keyboard = g_cap.id == "teclado";
-	auto mine = [&](SDL_JoystickID which) {
-		for (auto& d : g_devs) if (SDL_GetJoystickID(d.joy) == which) return d.id == g_cap.id;
-		return false;
-	};
-	int a = g_cap.action;
-	if (keyboard) {
-		if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) return Captured(Bind{ 'k', (int)ev.key.scancode, 1, 0 });
-		return false;
-	}
-	if (ev.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN && mine(ev.jbutton.which))
-		return Captured(Bind{ 'b', ev.jbutton.button, 1, 0 });
-	if (ev.type == SDL_EVENT_JOYSTICK_HAT_MOTION && mine(ev.jhat.which) && ev.jhat.value) {
-		// a single direction even if a diagonal shows up first
-		Uint8 want = a == 0 ? SDL_HAT_UP : a == 1 ? SDL_HAT_DOWN : a == 2 ? SDL_HAT_LEFT : a == 3 ? SDL_HAT_RIGHT : 0;
-		if (want && !(ev.jhat.value & want)) return false;
-		return Captured(Bind{ 'h', ev.jhat.hat, want ? want : ev.jhat.value, 0 });
-	}
-	if (ev.type == SDL_EVENT_JOYSTICK_AXIS_MOTION && mine(ev.jaxis.which)) {
-		int rest = ev.jaxis.axis < (int)g_cap.rest.size() ? g_cap.rest[ev.jaxis.axis] : 0;
-		int d = ev.jaxis.value - rest;
-		if (ev.jaxis.axis == g_cap.heldAxis) {   // the stick that set the last action: wait until it's back
-			if (abs(d) < 8000) g_cap.heldAxis = -1;
-			return false;
-		}
-		if (abs(d) > 16000) {
-			g_cap.heldAxis = ev.jaxis.axis;
-			return Captured(Bind{ 'a', ev.jaxis.axis, d > 0 ? 1 : -1, rest });
-		}
-	}
-	return false;
-}
-
-static std::string CaptureBanner()
-{
-	if (g_cap.action < 0) return "CONFIGURAR CONTROL\nPresiona cualquier boton en el control que quieres configurar (Esc = cancelar)";
-	return std::string("Presiona: ") + kActionNames[g_cap.action] + "\n" + g_cap.name + "   (" +
-	       std::to_string(g_cap.action + 1) + " de 12, Esc = dejarlo sin asignar)";
-}
 
 // ---------------------------------------------------------------------------
 
@@ -483,13 +745,13 @@ static int Play(const char* roms, bool test, const std::string& shots = "")
 	while (!quit) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
-			if (CaptureEvent(ev)) continue;
+			if (g_ctl.Event(ev)) continue;
 			switch (ev.type) {
 			case SDL_EVENT_QUIT: quit = true; break;
 			case SDL_EVENT_JOYSTICK_ADDED: AddDevice(ev.jdevice.which); break;
 			case SDL_EVENT_JOYSTICK_REMOVED: RemoveDevice(ev.jdevice.which); break;
 			case SDL_EVENT_KEY_DOWN:
-				if (ev.key.scancode == SDL_SCANCODE_F1) StartCapture();
+				if (ev.key.scancode == SDL_SCANCODE_F1) g_ctl.Open();
 				if (ev.key.scancode == SDL_SCANCODE_ESCAPE && !test) quit = true;
 				if (ev.key.scancode == SDL_SCANCODE_F11 || (ev.key.scancode == SDL_SCANCODE_RETURN && (ev.key.mod & SDL_KMOD_ALT)))
 					SDL_SetWindowFullscreen(g_win, !(SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN));
@@ -498,7 +760,7 @@ static int Play(const char* roms, bool test, const std::string& shots = "")
 		}
 		uint16_t in[2] = { 0, 0 };
 		if (!shots.empty()) { in[0] = RandomPad(frame, rng[0]); in[1] = RandomPad(frame, rng[1]); }
-		else if (!g_cap.active) ReadPlayers(in);   // while setting up a control the game gets nothing
+		else if (!g_ctl.open) ReadPlayers(in);   // while setting up a control the game gets nothing
 		guasa_run_frame(in, 1);
 		frame++;
 		if (shots.empty()) PushAudio();
@@ -551,7 +813,7 @@ static int Play(const char* roms, bool test, const std::string& shots = "")
 			if (frame > 120000) { printf("no termino ninguna pelea\n"); quit = true; }
 			continue;
 		}
-		std::string banner = g_cap.active ? CaptureBanner() : "";
+		std::string banner = "";
 		Present(test ? in : NULL, banner.empty() ? NULL : banner.c_str());
 
 		next += frameNs;
@@ -599,14 +861,14 @@ static int PlayArcade(const char* roms, const std::string& shots = "")
 	while (!quit) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
-			if (CaptureEvent(ev)) continue;
+			if (g_ctl.Event(ev)) continue;
 			switch (ev.type) {
 			case SDL_EVENT_QUIT: quit = true; break;
 			case SDL_EVENT_JOYSTICK_ADDED: AddDevice(ev.jdevice.which); break;
 			case SDL_EVENT_JOYSTICK_REMOVED: RemoveDevice(ev.jdevice.which); break;
 			case SDL_EVENT_KEY_DOWN:
 				if (ev.key.scancode == SDL_SCANCODE_ESCAPE) quit = true;
-				if (ev.key.scancode == SDL_SCANCODE_F1) StartCapture();
+				if (ev.key.scancode == SDL_SCANCODE_F1) g_ctl.Open();
 				if (ev.key.scancode == SDL_SCANCODE_F11 || (ev.key.scancode == SDL_SCANCODE_RETURN && (ev.key.mod & SDL_KMOD_ALT)))
 					SDL_SetWindowFullscreen(g_win, !(SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN));
 				break;
@@ -614,11 +876,11 @@ static int PlayArcade(const char* roms, const std::string& shots = "")
 		}
 		uint16_t in[2] = { 0, 0 };
 		const bool* keys = SDL_GetKeyboardState(NULL);
-		bool diag = !g_cap.active && keys[SDL_SCANCODE_F2], service = !g_cap.active && keys[SDL_SCANCODE_9];
+		bool diag = !g_ctl.open && keys[SDL_SCANCODE_F2], service = !g_ctl.open && keys[SDL_SCANCODE_9];
 		if (!shots.empty()) {   // the script: a coin, start, then the service menu
 			in[0] = (frame >= 1500 && frame < 1506 ? GUASA_COIN : 0) | (frame >= 1600 && frame < 1606 ? GUASA_START : 0);
 			diag = frame >= 2200 && frame < 2210;
-		} else if (!g_cap.active) ReadPlayers(in);
+		} else if (!g_ctl.open) ReadPlayers(in);
 		guasa_cabinet(diag, service);
 		guasa_run_frame(in, 1);
 		frame++;
@@ -633,12 +895,14 @@ static int PlayArcade(const char* roms, const std::string& shots = "")
 			SDL_RenderFillRect(g_ren, &bar);
 			Text(r.x + 6 * s, r.y + r.h - 11 * s, s, "MONEDA y START   F2 menu de servicio   9 credito   Esc salir", 220, 220, 220);
 		};
-		std::string banner = g_cap.active ? CaptureBanner() : "";
+		std::string banner = "";
 		Present(NULL, banner.empty() ? NULL : banner.c_str(), NULL, 0, shots.empty());
 		if (!shots.empty()) {
 			for (auto [f, name] : { std::pair<int, const char*>{ 400, "arcade-encendido" }, { 1560, "arcade-moneda" },
-			                        { 1900, "arcade-start" }, { 2600, "arcade-servicio" } })
+			                        { 1900, "arcade-start" }, { 1960, "arcade-f1" }, { 2600, "arcade-servicio" } })
 				if (frame == f) SaveWindow(shots + "/" + name + ".bmp");
+			if (frame == 1950) g_ctl.Open();   // F1: the controls panel over the game
+			if (frame == 1961) g_ctl.open = false;
 			SDL_RenderPresent(g_ren);
 			if (frame == 2600) quit = true;
 			continue;
@@ -676,12 +940,10 @@ static void DrawStats(const NetStats& st, int local)
 	SDL_FRect r = GameRect();
 	float s = r.h / 450 > 1 ? r.h / 450 : 1;
 	char line[200];
-	char watching[32] = "";
-	if (g_watchers > 0) snprintf(watching, sizeof(watching), "   espectadores %d", (int)g_watchers);
-	snprintf(line, sizeof(line), "P%d   ping %u ms   jitter %.0f ms   delay %d   rollback %d (max %d)%s%s%s",
+	snprintf(line, sizeof(line), "P%d   ping %u ms   jitter %.0f ms   delay %d   rollback %d (max %d)%s%s",
 	         local + 1, st.ping, st.jitter, st.delay, st.lastRollback, st.maxRollback,
 	         g_voiceMic < 0 ? "" : g_voiceMic ? "   F7 mic: si" : "   F7 mic: NO",
-	         g_voiceRival < 0 ? "" : g_voiceRival ? "  F8 rival: se oye" : "  F8 rival: SILENCIADO", watching);
+	         g_voiceRival < 0 ? "" : g_voiceRival ? "  F8 rival: se oye" : "  F8 rival: SILENCIADO");
 	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
 	SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 150);
 	SDL_FRect box{ r.x, r.y, r.w, 14 * s };
@@ -764,9 +1026,27 @@ static void NameColor(const std::string& name, Uint8& r, Uint8& g, Uint8& b)
 	r = p[0]; g = p[1]; b = p[2];
 }
 
-// Each side's player, as the app says: name and rank (empty: no rank yet).
+// Each side's player, as the app says: name and rank (empty: no rank yet), the
+// PNG of their profile photo (empty: none), and the set's score (-1: not known yet).
 static std::mutex g_namesLock;
-static std::string g_names[2], g_ranks[2];
+static std::string g_names[2], g_ranks[2], g_photos[2];
+static std::atomic<int> g_score[2] = { -1, -1 };
+
+// A profile photo the app left in a file, loaded once (the next frame after it arrives).
+static SDL_Texture* PhotoTexture(const std::string& file)
+{
+	static std::map<std::string, SDL_Texture*> cache;
+	if (file.empty()) return NULL;
+	auto it = cache.find(file);
+	if (it != cache.end()) return it->second;
+	SDL_Texture* t = NULL;
+	if (SDL_Surface* sf = SDL_LoadPNG(file.c_str())) {
+		t = SDL_CreateTextureFromSurface(g_ren, sf);
+		SDL_DestroySurface(sf);
+	}
+	cache[file] = t;
+	return t;
+}
 
 // A rank's badge, from the "rangos" folder next to the game (loaded once).
 static SDL_Texture* RankTexture(const std::string& rank)
@@ -785,30 +1065,63 @@ static SDL_Texture* RankTexture(const std::string& rank)
 	return t;
 }
 
-// Under the top line: player 1's name and badge on the left, player 2's on the right.
+// Under the top line, in the middle, like Fightcade's: "photo name 2 VS 1 name
+// photo" (player 1 on the left), the score in the set's color. Without a photo,
+// the rank's badge.
 static void DrawNames(const SDL_FRect& r)
 {
-	std::string names[2], ranks[2];
+	std::string names[2], ranks[2], photos[2];
 	{
 		std::lock_guard<std::mutex> lock(g_namesLock);
-		for (int p = 0; p < 2; p++) { names[p] = g_names[p]; ranks[p] = g_ranks[p]; }
+		for (int p = 0; p < 2; p++) { names[p] = Plain(g_names[p]); ranks[p] = g_ranks[p]; photos[p] = g_photos[p]; }
 	}
-	float s = r.h / 450 > 1 ? r.h / 450 : 1, h = 22 * s, y = r.y + 15 * s, ts = s * 1.25f;
-	for (int p = 0; p < 2; p++) {
-		if (names[p].empty()) continue;
-		std::string n = Plain(names[p]);
-		float w = h + 6 * s + n.size() * 8 * ts + 12 * s;
-		SDL_FRect box{ p ? r.x + r.w - w - 4 * s : r.x + 4 * s, y, w, h };
-		SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
-		SDL_SetRenderDrawColor(g_ren, 0, 0, 0, 140);
-		SDL_RenderFillRect(g_ren, &box);
-		SDL_FRect badge{ box.x + 3 * s, box.y + 1 * s, h - 2 * s, h - 2 * s };
-		if (SDL_Texture* t = ranks[p].empty() ? NULL : RankTexture(ranks[p])) SDL_RenderTexture(g_ren, t, NULL, &badge);
-		else Text(badge.x + 3 * s, badge.y + 3 * s, s, "?", 170, 170, 170);
-		Uint8 cr, cg, cb;
-		NameColor(names[p], cr, cg, cb);
-		Text(box.x + h + 6 * s, box.y + 6 * s, ts, n.c_str(), cr, cg, cb);
-	}
+	if (names[0].empty() && names[1].empty()) return;
+	float s = r.h / 450 > 1 ? r.h / 450 : 1, ts = s * 1.5f, h = 24 * s, pic = h - 4 * s, gap = 8 * s;
+	char sc[2][8];
+	for (int p = 0; p < 2; p++) snprintf(sc[p], sizeof(sc[p]), "%d", SDL_max((int)g_score[p], 0));
+	float cw = 8 * ts;   // one character
+	float w = 2 * (pic + gap) + (names[0].size() + names[1].size()) * cw + (strlen(sc[0]) + strlen(sc[1]) + 2) * cw + 6 * gap + 2 * gap;
+	SDL_FRect box{ r.x + r.w / 2 - w / 2, r.y + 15 * s, w, h };
+	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+	SDL_SetRenderDrawColor(g_ren, 8, 10, 16, 200);
+	SDL_RenderFillRect(g_ren, &box);
+	float x = box.x + gap, ty = box.y + (h - 8 * ts) / 2;
+	auto face = [&](int p) {
+		SDL_FRect f{ x, box.y + 2 * s, pic, pic };
+		SDL_Texture* t = PhotoTexture(photos[p]);
+		if (!t && !ranks[p].empty()) t = RankTexture(ranks[p]);
+		if (t) SDL_RenderTexture(g_ren, t, NULL, &f);
+		x += pic + gap;
+	};
+	auto word = [&](const char* text, Uint8 cr, Uint8 cg, Uint8 cb) { Text(x, ty, ts, text, cr, cg, cb); x += strlen(text) * cw + gap; };
+	Uint8 nr, ng, nb;
+	face(0);
+	NameColor(g_names[0], nr, ng, nb);
+	word(names[0].c_str(), nr, ng, nb);
+	word(sc[0], 80, 210, 230);
+	word("VS", 150, 150, 160);
+	word(sc[1], 80, 210, 230);
+	NameColor(g_names[1], nr, ng, nb);
+	word(names[1].c_str(), nr, ng, nb);
+	face(1);
+}
+
+// At the bottom, in the middle: an eye and how many are watching the set (only
+// while someone is), so the players know.
+static void DrawWatchers(const SDL_FRect& r)
+{
+	int n = g_watchers;
+	if (n <= 0) return;
+	float s = r.h / 450 > 1 ? r.h / 450 : 1, h = 18 * s, eye = 20 * s;
+	char num[8];
+	snprintf(num, sizeof(num), "%d", n);
+	float w = eye + 10 * s + strlen(num) * 8 * 1.5f * s + 14 * s;
+	SDL_FRect box{ r.x + r.w / 2 - w / 2, r.y + r.h - h - 6 * s, w, h };
+	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
+	SDL_SetRenderDrawColor(g_ren, 8, 10, 16, 190);
+	SDL_RenderFillRect(g_ren, &box);
+	if (SDL_Texture* t = ControlTexture("ojo")) { SDL_FRect e{ box.x + 7 * s, box.y + (h - eye * 0.6f) / 2, eye, eye * 0.6f }; SDL_RenderTexture(g_ren, t, NULL, &e); }
+	Text(box.x + eye + 14 * s, box.y + (h - 12 * s) / 2, 1.5f * s, num, 235, 235, 240);
 }
 
 struct ShownMessage { std::string from, text; Uint64 at; int side; };   // side: 0 player 1, 1 player 2
@@ -947,6 +1260,14 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 				if (tab != std::string::npos) inbox.push_back({ line.substr(8, tab - 8), line.substr(tab + 1), 0, 0 });
 			}
 			if (line.rfind("espectadores ", 0) == 0) g_watchers = atoi(line.c_str() + 13);
+			if (line.rfind("marcador ", 0) == 0) {   // "marcador <p1> <p2>": the set's score
+				int a = 0, b = 0;
+				if (sscanf(line.c_str() + 9, "%d %d", &a, &b) == 2) { g_score[0] = a; g_score[1] = b; }
+			}
+			if (line.rfind("foto ", 0) == 0 && line.size() > 7 && (line[5] == '0' || line[5] == '1')) {   // "foto <0|1> <png>"
+				std::lock_guard<std::mutex> lock(g_namesLock);
+				g_photos[line[5] - '0'] = line.substr(7);
+			}
 			if (line.rfind("voz estado", 0) == 0) {
 				auto val = [&](const char* key) {
 					size_t at = line.find(key);
@@ -1022,7 +1343,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 	while (!quit) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
-			if (CaptureEvent(ev)) continue;
+			if (g_ctl.Event(ev)) continue;
 			switch (ev.type) {
 			case SDL_EVENT_QUIT: quit = true; break;
 			case SDL_EVENT_JOYSTICK_ADDED: AddDevice(ev.jdevice.which); break;
@@ -1065,7 +1386,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 				case SDL_SCANCODE_F4: openPanel(true); break;
 				case SDL_SCANCODE_P: if (!KeyIsButton(SDL_SCANCODE_P)) askPause(); break;
 				case SDL_SCANCODE_F3: case SDL_SCANCODE_PAUSE: askPause(); break;
-				case SDL_SCANCODE_F1: StartCapture(); break;
+				case SDL_SCANCODE_F1: g_ctl.Open(); break;
 				case SDL_SCANCODE_F2: showInputs = !showInputs; break;
 				case SDL_SCANCODE_F5: net.SetDelay(net.Stats().delay - 1); break;
 				case SDL_SCANCODE_F6: net.SetDelay(net.Stats().delay + 1); break;
@@ -1089,7 +1410,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 		uint16_t in[2] = { 0, 0 };
 		// this side plays with player 1's controls; while the message panel is open
 		// the keyboard only types (a key that is also a button mustn't send or close it)
-		if (!g_cap.active) ReadPlayers(in, !panel.open);
+		if (!g_ctl.open) ReadPlayers(in, !panel.open);
 		uint16_t pad = in[0], pressed = pad & ~lastPad;
 		lastPad = pad;
 		if (panel.open) {   // with the controller: directions move, a punch sends, a kick closes
@@ -1108,7 +1429,10 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 			static int t = 0;
 			t++;
 			if (t == 60) {
-				{ std::lock_guard<std::mutex> lock(g_namesLock); g_names[0] = "yoy"; g_ranks[0] = "Naboria"; g_names[1] = "ELGINGIRIANO"; g_ranks[1] = ""; }
+				{ std::lock_guard<std::mutex> lock(g_namesLock); g_names[0] = "yoy"; g_ranks[0] = "Naboria"; g_names[1] = "ELGINGIRIANO"; g_ranks[1] = "";
+				  g_photos[0] = std::string(SDL_GetBasePath()) + "emojis/ggs.png"; }   // a picture as yoy's photo
+				g_score[0] = 2; g_score[1] = 1;
+				g_watchers = 2;
 				std::lock_guard<std::mutex> lock(inboxLock);
 				inbox.push_back({ "ELGINGIRIANO", ":palomo:", 0, 0 });
 				inbox.push_back({ "ELGINGIRIANO", "Que tal, mi hermano? Una mas!", 0, 0 });
@@ -1146,8 +1470,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 
 		std::string banner;
 		const PauseState& ps = net.Pause();
-		if (g_cap.active) banner = CaptureBanner();
-		else if (st == NetMatch::Waiting) banner = "CONECTANDO\n" + net.RouteText() + "   (Esc = salir)";
+		if (st == NetMatch::Waiting) banner = "CONECTANDO\n" + net.RouteText() + "   (Esc = salir)";
 		else if (ps.phase == 1) {
 			int left = (int)((5 * 60 * guasa_fps() - ps.frames) / guasa_fps());
 			char b[160];
@@ -1160,7 +1483,7 @@ static int PlayOnline(const char* roms, const NetConfig& cfg, const std::string&
 			if (SDL_GetTicksNS() - endedAt > 8000000000ULL) quit = true;
 		}
 		g_overlay = [&](const SDL_FRect& r) {
-			if (st == NetMatch::Playing || st == NetMatch::Ended) DrawNames(r);
+			if (st == NetMatch::Playing || st == NetMatch::Ended) { DrawNames(r); DrawWatchers(r); }
 			DrawMessages(r, shownMsgs);
 			if (panel.open) panel.Draw(r);
 			if (!note.empty() && SDL_GetTicksNS() - noteAt < 2500000000ULL) {
@@ -1531,6 +1854,7 @@ static void DrawPractice(const Practice& P, const std::vector<MenuItem>* menu, i
 		Text(L.box.x + 12 * bs, L.box.y + L.box.h - 13 * bs, bs * 0.75f,
 		     "Flechas: elegir  Golpe/clic: cambiar  Patada/Esc: cerrar", 170, 170, 170);
 	}
+	g_ctl.Draw();
 	SDL_RenderPresent(g_ren);
 }
 
@@ -1647,7 +1971,7 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 	while (!quit) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
-			if (CaptureEvent(ev)) continue;
+			if (g_ctl.Event(ev)) continue;
 			switch (ev.type) {
 			case SDL_EVENT_QUIT: quit = true; break;
 			case SDL_EVENT_JOYSTICK_ADDED: AddDevice(ev.jdevice.which); break;
@@ -1657,7 +1981,7 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 				switch (ev.key.scancode) {
 				case SDL_SCANCODE_ESCAPE: if (menuOpen) menuOpen = false; else quit = true; break;
 				case SDL_SCANCODE_TAB: openMenu(!menuOpen); break;
-				case SDL_SCANCODE_F1: StartCapture(); break;
+				case SDL_SCANCODE_F1: g_ctl.Open(); break;
 				case SDL_SCANCODE_F2: P.showHistory = !P.showHistory; break;
 				case SDL_SCANCODE_F3: if (P.rec == Practice::NoRec) P.controlRival = !P.controlRival; break;
 				case SDL_SCANCODE_F4: P.stance = (P.stance + 1) % kStances; P.replay = false; say(std::string("Rival: ") + StanceName(P.stance)); break;
@@ -1700,7 +2024,7 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 		}
 
 		uint16_t in[2] = { 0, 0 };
-		if (!g_cap.active) ReadPlayers(in);
+		if (!g_ctl.open) ReadPlayers(in);
 		if (!shots.empty()) {   // the script: pick both, walk up, hit, then the menu
 			static int t = 0, fightAt = -1;
 			t++;
@@ -1744,7 +2068,7 @@ static int PlayPractice(const char* roms, const std::string& shots, int stage)
 			PushAudio();
 			P.AfterFrame(out);
 			if (noteFrames > 0 && --noteFrames == 0) note.clear();
-			std::string banner = g_cap.active ? CaptureBanner() : "";
+			std::string banner = "";
 			if (!banner.empty()) Present(NULL, banner.c_str());
 			else DrawPractice(P, NULL, 0, note);
 		}
@@ -1811,309 +2135,37 @@ static int ChallengerSound(const char* roms, const char* out)
 }
 
 
-// ---------------------------------------------------------------------------
-// guasa-game controles: setting up a control on a picture of the La Guasabara
-// cabinet's panel (player 1's side, arte-app/controles), one action at a time and
-// in any order: a click on a piece of it, or on the list next to it (or Enter),
-// waits for the input that goes there. Which device: the
-// arrows at the top, or press anything on it. What's pressed lights up, so it
-// can be tried right there. Each change is saved at once (controles.txt).
-
-static SDL_Texture* ControlTexture(const char* name)
-{
-	static std::map<std::string, SDL_Texture*> cache;
-	auto it = cache.find(name);
-	if (it != cache.end()) return it->second;
-	SDL_Texture* t = NULL;
-	if (SDL_Surface* sf = SDL_LoadPNG((std::string(SDL_GetBasePath()) + "controles/" + name + ".png").c_str())) {
-		t = SDL_CreateTextureFromSurface(g_ren, sf);
-		SDL_DestroySurface(sf);
-	}
-	cache[name] = t;
-	return t;
-}
-
-// What a bind is, in a few words.
-static std::string BindText(const Bind& b)
-{
-	char s[64];
-	switch (b.kind) {
-	case 'k': snprintf(s, sizeof(s), "Tecla %s", SDL_GetScancodeName((SDL_Scancode)b.index)); break;
-	case 'b': snprintf(s, sizeof(s), "Boton %d", b.index + 1); break;
-	case 'h': snprintf(s, sizeof(s), "Cruceta %s", b.value == SDL_HAT_UP ? "arriba" : b.value == SDL_HAT_DOWN ? "abajo" :
-	                   b.value == SDL_HAT_LEFT ? "izquierda" : b.value == SDL_HAT_RIGHT ? "derecha" : "?"); break;
-	case 'a': snprintf(s, sizeof(s), "Eje %d %s", b.index + 1, b.value > 0 ? "+" : "-"); break;
-	default: return "(sin asignar)";
-	}
-	return s;
-}
-
-// A gamepad without a setup works with GamepadDefault; to change it one bind at
-// a time, those defaults are written as the joystick's own inputs.
-static Mapping MappingFromGamepad(SDL_Gamepad* g, const std::string& name)
-{
-	static const SDL_GamepadButton want[kActions] = { SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN,
-		SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_WEST, SDL_GAMEPAD_BUTTON_NORTH,
-		SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_INVALID,
-		SDL_GAMEPAD_BUTTON_START, SDL_GAMEPAD_BUTTON_BACK };
-	Mapping m{ name, {} };
-	int n = 0;
-	SDL_GamepadBinding** binds = SDL_GetGamepadBindings(g, &n);
-	for (int a = 0; a < kActions; a++)
-		for (int i = 0; i < n; i++) {
-			const SDL_GamepadBinding& gb = *binds[i];
-			bool hit = want[a] != SDL_GAMEPAD_BUTTON_INVALID ? gb.output_type == SDL_GAMEPAD_BINDTYPE_BUTTON && gb.output.button == want[a]
-			                                                 : gb.output_type == SDL_GAMEPAD_BINDTYPE_AXIS && gb.output.axis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
-			if (!hit) continue;
-			if (gb.input_type == SDL_GAMEPAD_BINDTYPE_BUTTON) m.b[a] = { 'b', gb.input.button, 1, 0 };
-			else if (gb.input_type == SDL_GAMEPAD_BINDTYPE_HAT) m.b[a] = { 'h', gb.input.hat.hat, gb.input.hat.hat_mask, 0 };
-			else if (gb.input_type == SDL_GAMEPAD_BINDTYPE_AXIS) m.b[a] = { 'a', gb.input.axis.axis, gb.input.axis.axis_max > 0 ? 1 : -1, 0 };
-			break;
-		}
-	SDL_free(binds);
-	return m;
-}
 
 static int ControlsScreen(const std::string& shots)
 {
 	if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
-	const float W = 1000, H = 660;   // the screen is drawn at this size and scaled to the window
-	g_win = SDL_CreateWindow("La Guasabara - Controles", (int)W, (int)H, SDL_WINDOW_RESIZABLE);
+	g_win = SDL_CreateWindow("La Guasabara - Controles", (int)ControlsPanel::W, (int)ControlsPanel::H, SDL_WINDOW_RESIZABLE);
 	g_ren = g_win ? SDL_CreateRenderer(g_win, NULL) : NULL;
 	if (!g_ren) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
-	SDL_SetRenderLogicalPresentation(g_ren, (int)W, (int)H, SDL_LOGICAL_PRESENTATION_LETTERBOX);
 	SDL_SetRenderVSync(g_ren, 1);
 	LoadMaps();
 	printf("controles\n");
 	fflush(stdout);
-
-	// the device being set up: "teclado" or a joystick's id, and its binds as they are now
-	std::string devId = "teclado", devName = "Teclado";
-	Mapping cur;
-	auto device = [&]() -> Device* { for (auto& d : g_devs) if (d.id == devId) return &d; return NULL; };
-	auto pick = [&](const std::string& id) {
-		devId = id;
-		Device* d = device();
-		devName = d ? d->name : "Teclado";
-		auto m = g_maps.find(id);
-		cur = m != g_maps.end() ? m->second : id == "teclado" ? KeyboardDefault() : d && d->pad ? MappingFromGamepad(d->pad, devName) : Mapping{ devName, {} };
-	};
-	pick("teclado");
-	auto save = [&]() { cur.name = devName; g_maps[devId] = cur; SaveMaps(); };
-
-	// The panel (player 1's side of the La Guasabara cabinet, 515 x 340), and
-	// where each piece is on it: the stick's four ways are small arrows around
-	// it, the buttons and start are circles (found on the picture)
-	const float panelW = 515, panelH = 340, k = 470 / panelH, px0 = 24, py0 = 120;
-	auto at = [&](float x, float y) { return SDL_FPoint{ px0 + x * k, py0 + y * k }; };
-	struct Spot { SDL_FPoint c; float r; bool round; float h = 0; };   // h: a box's half height, if not square
-	const float stickX = 118, stickY = 188, arm = 60, arrow = 15;
-	Spot spots[kActions] = {
-		{ at(stickX, stickY - arm), arrow * k, false }, { at(stickX, stickY + arm), arrow * k, false },
-		{ at(stickX - arm, stickY), arrow * k, false }, { at(stickX + arm, stickY), arrow * k, false },
-		{ at(227, 166), 41 * k, true }, { at(317, 164), 41 * k, true }, { at(410, 166), 41 * k, true },
-		{ at(224, 262), 41 * k, true }, { at(316, 255), 41 * k, true }, { at(409, 257), 41 * k, true },
-		{ at(428, 44), 39 * k, true },
-		{ at(471, 311), 43 * k, false, 28 * k },   // coin: the panel has none, so a box in its free corner
-	};
-	const char* color[6] = { "rojo", "blanco", "azul", "rojo", "blanco", "azul" };
-	const char* arrows[4] = { "^", "v", "<", ">" };
-	// the list on the right: every action and what it has
-	const float listX = px0 + panelW * k + 16, listW = W - 24 - listX, rowH = 37, listY = 120;
-	auto row = [&](int a) { return SDL_FRect{ listX, listY + a * rowH + 4, listW, rowH - 4 }; };
-	const SDL_FRect prev{ 152, 66, 34, 30 }, next{ 560, 66, 34, 30 }, reset{ 640, 606, 160, 38 }, done{ 816, 606, 160, 38 };
-
-	int focus = 4, listen = -1, heldAxis = -1;
-	float mx = -1, my = -1;
-	std::string note;
-	Uint64 noteAt = 0;
-	auto say = [&](const std::string& t) { note = t; noteAt = SDL_GetTicksNS(); };
-	auto inside = [](const SDL_FRect& r, float x, float y) { return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h; };
-	auto spotAt = [&](float x, float y) {
-		for (int a = 0; a < kActions; a++) {
-			if (inside(row(a), x, y)) return a;
-			const Spot& sp = spots[a];
-			float dx = x - sp.c.x, dy = y - sp.c.y;
-			if (sp.round ? dx * dx + dy * dy <= sp.r * sp.r : SDL_fabsf(dx) <= sp.r && SDL_fabsf(dy) <= (sp.h ? sp.h : sp.r)) return a;
-		}
-		return -1;
-	};
-	auto assign = [&](const Bind& b) {
-		for (int j = 0; j < kActions; j++)   // the same input somewhere else: it moves here
-			if (j != listen && cur.b[j].kind == b.kind && cur.b[j].index == b.index && cur.b[j].value == b.value) cur.b[j] = Bind{ 0, 0, 0, 0 };
-		cur.b[listen] = b;
-		save();
-		say(std::string(kActionNames[listen]) + ": " + BindText(b));
-		listen = -1;
-	};
-	auto devices = [&]() { std::vector<std::string> ids{ "teclado" }; for (auto& d : g_devs) ids.push_back(d.id); return ids; };
-	auto step = [&](int d) {
-		auto ids = devices();
-		size_t i = 0;
-		while (i < ids.size() && ids[i] != devId) i++;
-		pick(ids[(i + ids.size() + d) % ids.size()]);
-		listen = -1;
-	};
-
+	g_ctl.Open();
 	int frame = 0;
-	bool quit = false;
-	while (!quit) {
+	while (g_ctl.open) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
-			SDL_ConvertEventToRenderCoordinates(g_ren, &ev);
-			if (ev.type == SDL_EVENT_QUIT) quit = true;
+			if (ev.type == SDL_EVENT_QUIT) g_ctl.open = false;
 			if (ev.type == SDL_EVENT_JOYSTICK_ADDED) AddDevice(ev.jdevice.which);
-			if (ev.type == SDL_EVENT_JOYSTICK_REMOVED) {
-				RemoveDevice(ev.jdevice.which);
-				if (!device() && devId != "teclado") pick("teclado");
-			}
-			if (ev.type == SDL_EVENT_MOUSE_MOTION) { mx = ev.motion.x; my = ev.motion.y; }
-			// which device sent it (empty: none of the joysticks)
-			std::string from;
-			SDL_JoystickID which = ev.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN ? ev.jbutton.which : ev.type == SDL_EVENT_JOYSTICK_HAT_MOTION ? ev.jhat.which
-			                     : ev.type == SDL_EVENT_JOYSTICK_AXIS_MOTION ? ev.jaxis.which : 0;
-			if (which) for (auto& d : g_devs) if (SDL_GetJoystickID(d.joy) == which) from = d.id;
-			if (listen >= 0) {
-				if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.scancode == SDL_SCANCODE_ESCAPE) { listen = -1; say("Cancelado"); continue; }
-				if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) { listen = -1; continue; }
-				if (devId == "teclado") {
-					if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) assign(Bind{ 'k', (int)ev.key.scancode, 1, 0 });
-					continue;
-				}
-				if (from != devId) continue;
-				Device* d = device();
-				if (ev.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN) assign(Bind{ 'b', ev.jbutton.button, 1, 0 });
-				else if (ev.type == SDL_EVENT_JOYSTICK_HAT_MOTION && ev.jhat.value) {
-					// one direction even if a diagonal comes first; for a direction, the one asked for
-					Uint8 v = ev.jhat.value, want = listen == 0 ? SDL_HAT_UP : listen == 1 ? SDL_HAT_DOWN : listen == 2 ? SDL_HAT_LEFT : listen == 3 ? SDL_HAT_RIGHT : 0;
-					if (want && !(v & want)) continue;
-					if (!want) want = (v & SDL_HAT_UP) ? SDL_HAT_UP : (v & SDL_HAT_DOWN) ? SDL_HAT_DOWN : (v & SDL_HAT_LEFT) ? SDL_HAT_LEFT : SDL_HAT_RIGHT;
-					assign(Bind{ 'h', ev.jhat.hat, want, 0 });
-				} else if (ev.type == SDL_EVENT_JOYSTICK_AXIS_MOTION && d) {
-					int rest = ev.jaxis.axis < (int)d->rest.size() ? d->rest[ev.jaxis.axis] : 0, v = ev.jaxis.value - rest;
-					if (ev.jaxis.axis == heldAxis) { if (abs(v) < 8000) heldAxis = -1; continue; }
-					if (abs(v) > 16000) { heldAxis = ev.jaxis.axis; assign(Bind{ 'a', ev.jaxis.axis, v > 0 ? 1 : -1, rest }); }
-				}
-				continue;
-			}
-			// not waiting for an input: a press on another control picks that control
-			if (!from.empty() && from != devId && (ev.type == SDL_EVENT_JOYSTICK_BUTTON_DOWN || (ev.type == SDL_EVENT_JOYSTICK_HAT_MOTION && ev.jhat.value))) {
-				pick(from);
-				say("Configurando: " + devName);
-			}
-			if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) {
-				switch (ev.key.scancode) {
-				case SDL_SCANCODE_ESCAPE: quit = true; break;
-				case SDL_SCANCODE_TAB: case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_DOWN: focus = (focus + 1) % kActions; break;
-				case SDL_SCANCODE_LEFT: case SDL_SCANCODE_UP: focus = (focus + kActions - 1) % kActions; break;
-				case SDL_SCANCODE_RETURN: case SDL_SCANCODE_SPACE: listen = focus; heldAxis = -1; break;
-				case SDL_SCANCODE_DELETE: case SDL_SCANCODE_BACKSPACE: cur.b[focus] = Bind{ 0, 0, 0, 0 }; save(); say(std::string(kActionNames[focus]) + ": sin asignar"); break;
-				case SDL_SCANCODE_PAGEUP: step(-1); break;
-				case SDL_SCANCODE_PAGEDOWN: step(1); break;
-				default: break;
-				}
-			}
-			if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_LEFT) {
-				float x = ev.button.x, y = ev.button.y;
-				int a = spotAt(x, y);
-				if (a >= 0) { focus = listen = a; heldAxis = -1; }
-				else if (inside(prev, x, y)) step(-1);
-				else if (inside(next, x, y)) step(1);
-				else if (inside(done, x, y)) quit = true;
-				else if (inside(reset, x, y)) {
-					g_maps.erase(devId);
-					SaveMaps();
-					pick(devId);
-					say("Como venia de fabrica");
-				}
-			}
+			if (ev.type == SDL_EVENT_JOYSTICK_REMOVED) RemoveDevice(ev.jdevice.which);
+			g_ctl.Event(ev);
 		}
-
-		// what's pressed now on the device being set up
-		Device* d = device();
-		bool down[kActions];
-		for (int a = 0; a < kActions; a++) down[a] = (devId == "teclado" || d) && BindDown(d, cur.b[a]);
-		bool blink = (frame / 15) % 2;
-		int hover = spotAt(mx, my);
-
 		SDL_SetRenderDrawColor(g_ren, 13, 14, 19, 255);
 		SDL_RenderClear(g_ren);
-		SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
-		Text(24, 20, 3, "CONTROLES", 255, 46, 136);
-		Text(300, 28, 1.5f, "Haz clic en una pieza y aprieta lo que va ahi", 200, 200, 210);
-		// the device, with arrows to change it
-		Text(24, 74, 1.75f, "Control:", 200, 200, 210);
-		for (const SDL_FRect* r : { &prev, &next }) {
-			SDL_SetRenderDrawColor(g_ren, 40, 42, 54, 255);
-			SDL_RenderFillRect(g_ren, r);
-			Text(r->x + 11, r->y + 8, 1.75f, r == &prev ? "<" : ">", 255, 255, 255);
-		}
-		std::string shown = devName.substr(0, 40);
-		Text(prev.x + 46, 74, 1.75f, shown.c_str(), 255, 220, 120);
-		Text(next.x + 48, 76, 1.25f, "o aprieta algo en ese control", 150, 150, 160);
-		// the panel, and on it what's pressed and what's chosen
-		if (SDL_Texture* t = ControlTexture("panel")) { SDL_FRect r{ px0, py0, panelW * k, panelH * k }; SDL_RenderTexture(g_ren, t, NULL, &r); }
-		for (int a = 0; a < kActions; a++) {
-			const Spot& sp = spots[a];
-			bool wait = a == listen, on = a == focus || a == hover;
-			float hh = sp.h ? sp.h : sp.r;
-			SDL_FRect r{ sp.c.x - sp.r, sp.c.y - hh, 2 * sp.r, 2 * hh };
-			if (sp.round) {
-				if (down[a]) {   // pressed: the button pressed, on top of the panel's
-					std::string name = std::string("boton-") + (a < 10 ? color[a - 4] : "blanco") + "-apretado";
-					if (SDL_Texture* t = ControlTexture(name.c_str())) SDL_RenderTexture(g_ren, t, NULL, &r);
-				}
-			} else {   // a way of the stick (an arrow) or the coin: yellow while pressed
-				SDL_SetRenderDrawColor(g_ren, down[a] ? 255 : 0, down[a] ? 220 : 0, down[a] ? 60 : 0, down[a] ? 255 : a == 11 ? 235 : 170);
-				SDL_RenderFillRect(g_ren, &r);
-				Uint8 c = down[a] ? 20 : 255;
-				if (a < 4) Text(sp.c.x - 8, sp.c.y - 8, 2, arrows[a], c, c, c);
-				else {
-					SDL_SetRenderDrawColor(g_ren, 212, 160, 60, 255);   // a golden edge, like the panel's labels
-					SDL_RenderRect(g_ren, &r);
-					Text(sp.c.x - 36, sp.c.y - 7, 1.5f, "MONEDA", down[a] ? 20 : 255, down[a] ? 20 : 220, down[a] ? 20 : 120);
-				}
-			}
-			if (wait || on) {   // chosen: a ring (pink and blinking while it waits for the input)
-				if (wait && !blink) continue;
-				SDL_SetRenderDrawColor(g_ren, wait ? 255 : 255, wait ? 46 : 220, wait ? 136 : 120, 255);
-				for (int t = 0; t < (wait ? 4 : 2); t++) { SDL_FRect o{ r.x - 4 - t, r.y - 4 - t, r.w + 8 + 2 * t, r.h + 8 + 2 * t }; SDL_RenderRect(g_ren, &o); }
-			}
-		}
-		// the list: every action, what it has, lit while pressed
-		for (int a = 0; a < kActions; a++) {
-			SDL_FRect r = row(a);
-			bool wait = a == listen, on = a == focus || a == hover;
-			SDL_SetRenderDrawColor(g_ren, down[a] ? 255 : 28, down[a] ? 220 : 30, down[a] ? 120 : 40, 255);
-			SDL_RenderFillRect(g_ren, &r);
-			if (wait ? blink : on) {
-				SDL_SetRenderDrawColor(g_ren, 255, wait ? 46 : 220, wait ? 136 : 120, 255);
-				SDL_RenderRect(g_ren, &r);
-			}
-			Uint8 c = down[a] ? 20 : 255;
-			Text(r.x + 8, r.y + 5, 1.25f, kActionNames[a], c, c, c);
-			std::string bind = wait ? "Aprieta..." : BindText(cur.b[a]);
-			Text(r.x + 8, r.y + 19, 1, bind.c_str(), down[a] ? 40 : wait ? 255 : 170, down[a] ? 40 : wait ? 120 : 190, down[a] ? 40 : wait ? 170 : 220);
-		}
-		// the bottom: what's happening, and the buttons
-		std::string line = listen >= 0 ? std::string("Aprieta en ") + devName.substr(0, 28) + " lo que quieres para " + kActionNames[listen] + "   (Esc: cancelar)"
-		                 : note.size() && SDL_GetTicksNS() - noteAt < 4000000000ULL ? note
-		                 : "Clic o Enter: asignar   Supr: dejar vacio   Flechas: elegir   Esc: salir";
-		Text(24, 620, 1, line.c_str(), listen >= 0 ? 255 : 200, listen >= 0 ? 120 : 200, listen >= 0 ? 170 : 210);
-		for (const SDL_FRect* r : { &reset, &done }) {
-			bool h = inside(*r, mx, my);
-			SDL_SetRenderDrawColor(g_ren, r == &done ? 255 : 40, r == &done ? 46 : 42, r == &done ? 136 : 54, h ? 255 : 220);
-			SDL_RenderFillRect(g_ren, r);
-			const char* t = r == &done ? "LISTO" : "DE FABRICA";
-			Text(r->x + (r->w - strlen(t) * 12) / 2, r->y + 12, 1.5f, t, 255, 255, 255);
-		}
-
+		g_ctl.Draw();
 		if (!shots.empty()) {   // checking without hands: the keyboard's heavy punch, then Q pressed for it
+			if (frame == 2) g_ctl.pick("teclado");
 			if (frame == 20) SaveWindow(shots + "/controles.bmp");
-			if (frame == 25) { listen = focus = 6; }
+			if (frame == 25) { g_ctl.listen = g_ctl.focus = 6; }
 			if (frame == 31) SaveWindow(shots + "/controles-esperando.bmp");
 			if (frame == 33) { SDL_Event e{}; e.type = SDL_EVENT_KEY_DOWN; e.key.scancode = SDL_SCANCODE_Q; SDL_PushEvent(&e); }
-			if (frame == 40) { printf("puno fuerte: %s\n", BindText(cur.b[6]).c_str()); fflush(stdout); SaveWindow(shots + "/controles-asignado.bmp"); quit = true; }
+			if (frame == 40) { printf("puno fuerte: %s\n", BindText(g_ctl.cur.b[6]).c_str()); fflush(stdout); SaveWindow(shots + "/controles-asignado.bmp"); g_ctl.open = false; }
 		}
 		frame++;
 		SDL_RenderPresent(g_ren);
@@ -2483,7 +2535,7 @@ static int PlayReplay(const char* roms, const char* file, const std::string& sho
 	while (!quit) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
-			if (CaptureEvent(ev)) continue;
+			if (g_ctl.Event(ev)) continue;
 			switch (ev.type) {
 			case SDL_EVENT_QUIT: quit = true; break;
 			case SDL_EVENT_JOYSTICK_ADDED: AddDevice(ev.jdevice.which); break;
@@ -2618,7 +2670,7 @@ static int Spectate(const char* roms, bool pause, const std::string& shots = "")
 	while (!quit) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
-			if (CaptureEvent(ev)) continue;
+			if (g_ctl.Event(ev)) continue;
 			if (ev.type == SDL_EVENT_QUIT) quit = true;
 			if (ev.type == SDL_EVENT_KEY_DOWN) {
 				if (ev.key.scancode == SDL_SCANCODE_ESCAPE) quit = true;
@@ -2779,6 +2831,7 @@ int main(int argc, char** argv)
 			if (!strncmp(argv[i], "captura=", 8)) shots = argv[i] + 8;
 			else if (!strncmp(argv[i], "grabar=", 7)) recordTo = argv[i] + 7;
 			else if (!strcmp(argv[i], "transmitir")) stream = true;
+			else if (!strcmp(argv[i], "sinx3")) g_noX3 = true;   // someone in this set turns x3 down
 			else if (!ParseNetArg(argv[i], cfg)) { fprintf(stderr, "opción desconocida: %s\n", argv[i]); return 2; }
 		if (argc < 6 || cfg.local < 0 || cfg.local > 1 || (cfg.remote.empty() && (cfg.relay.empty() || cfg.token.size() != 16))) {
 			fprintf(stderr, "uso: guasa-game online <carpeta de ROMs> <1|2> <puerto_local> (<ip:puerto> | relay=<host:puerto> token=<32 hex> [relayonly]) [delay=N|auto] [lag=MS] [jitter=MS] [loss=PCT]\n");
