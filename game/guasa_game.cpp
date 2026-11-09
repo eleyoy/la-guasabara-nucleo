@@ -516,8 +516,8 @@ struct ControlsPanel {
 				return true;
 			}
 			if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.scancode == SDL_SCANCODE_ESCAPE) {
-				if (guided) advance(listen);   // paso a paso: Esc leaves this one as it is and goes on
-				else { listen = -1; say("Cancelado"); }
+				clear(listen);   // Esc while it waits: the action left empty (paso a paso: and on to the next)
+				advance(listen);
 				return true;
 			}
 			if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
@@ -666,8 +666,8 @@ struct ControlsPanel {
 			Text(r.x + 8, r.y + 16, 1, bind.c_str(), down[a] ? 40 : wait ? 255 : 170, down[a] ? 40 : wait ? 120 : 190, down[a] ? 40 : wait ? 170 : 220);
 		}
 		// the bottom: what's happening, and the buttons
-		std::string line = listen >= 0 && guided ? std::string("PASO A PASO ") + std::to_string(listen + 1) + "/" + std::to_string(kActions) + ": aprieta " + kActionNames[listen] + " (Esc: saltar)"
-		                 : listen >= 0 ? std::string("Aprieta lo que va en ") + kActionNames[listen] + (devId == "teclado" ? "  (Esc: cancelar)" : "  (Supr: vacio, Esc: cancelar)")
+		std::string line = listen >= 0 && guided ? std::string("PASO A PASO ") + std::to_string(listen + 1) + "/" + std::to_string(kActions) + ": aprieta " + kActionNames[listen] + " (Esc: dejarlo vacio)"
+		                 : listen >= 0 ? std::string("Aprieta lo que va en ") + kActionNames[listen] + "  (Esc: dejarlo vacio, clic: cancelar)"
 		                 : note.size() && SDL_GetTicksNS() - noteAt < 4000000000ULL ? note.substr(0, 52)
 		                 : "Clic: asignar   Clic derecho o Supr: vaciar   Esc: cerrar";
 		Text(24, 620, 1, line.c_str(), listen >= 0 ? 255 : 200, listen >= 0 ? 120 : 200, listen >= 0 ? 170 : 210);
@@ -2251,7 +2251,13 @@ static int ControlsScreen(const std::string& shots)
 			if (frame == 25) { g_ctl.listen = g_ctl.focus = 6; }
 			if (frame == 31) SaveWindow(shots + "/controles-esperando.bmp");
 			if (frame == 33) { SDL_Event e{}; e.type = SDL_EVENT_KEY_DOWN; e.key.scancode = SDL_SCANCODE_Q; SDL_PushEvent(&e); }
-			if (frame == 40) { printf("puno fuerte: %s\n", BindText(g_ctl.cur.b[6]).c_str()); fflush(stdout); SaveWindow(shots + "/controles-asignado.bmp"); g_ctl.open = false; }
+			if (frame == 40) { printf("puno fuerte: %s\n", BindText(g_ctl.cur.b[6]).c_str()); fflush(stdout); SaveWindow(shots + "/controles-asignado.bmp"); }
+			auto key = [](SDL_Scancode k) { SDL_Event e{}; e.type = SDL_EVENT_KEY_DOWN; e.key.scancode = k; SDL_PushEvent(&e); };
+			if (frame == 45) g_ctl.listen = g_ctl.focus = 12;   // x3 punches: W, then Esc while it waits leaves it empty
+			if (frame == 47) key(SDL_SCANCODE_W);
+			if (frame == 50) { printf("x3 punos: %s\n", BindText(g_ctl.cur.b[12]).c_str()); g_ctl.listen = 12; }
+			if (frame == 52) key(SDL_SCANCODE_ESCAPE);
+			if (frame == 56) { printf("x3 punos tras Esc: %s\n", BindText(g_ctl.cur.b[12]).c_str()); fflush(stdout); g_ctl.open = false; }
 		}
 		frame++;
 		SDL_RenderPresent(g_ren);
