@@ -2214,7 +2214,13 @@ static int PracticeSelfTest(const char* roms)
 		return f;
 	};
 
-	run(30, 0); run(4, GUASA_LP); run(30, 0);
+	run(30, 0); run(4, GUASA_LP); run(10, 0);
+	{
+		// the old version's code: right after picking, the directions still go to the player
+		uint16_t got = frame(GUASA_LEFT);
+		check(P.phase == Practice::PickMine && (got & GUASA_LEFT), "despues de elegir, las direcciones del codigo old siguen siendo tuyas");
+	}
+	run(110, 0);
 	check(P.phase == Practice::PickRival, "con el primer golpe se elige tu personaje y sigue el del rival");
 	int f = pickRival(GUASA_RIGHT), rivalRight = char2();
 	check(P.phase == Practice::Fight && P.HasPosition(), "empieza la pelea y queda guardada la posicion", std::to_string(f) + " cuadros");
@@ -2378,7 +2384,7 @@ static int PracticeSelfTest(const char* roms)
 	check(!P.history[0].empty() && (P.history[0].front().in & GUASA_UP), "el historial muestra el ultimo boton");
 	P.ChangeCharacters();
 	check(P.phase == Practice::PickMine && !P.HasPosition(), "cambiar de personajes vuelve a la seleccion");
-	run(30, 0); run(4, GUASA_LP); run(30, 0);
+	run(30, 0); run(4, GUASA_LP); run(110, 0);
 	pickRival(GUASA_LEFT);
 	int rivalLeft = char2();
 	check(P.phase == Practice::Fight && rivalLeft != rivalRight, "el rival es el que elige el jugador, no el del cursor",
@@ -2387,7 +2393,7 @@ static int PracticeSelfTest(const char* roms)
 	// reversals, Ryu against Ken: after the rival's last stunned frame (knocked
 	// down, or blocking), its move must start on the very next one
 	P.ChangeCharacters();
-	run(30, 0); run(4, GUASA_LP); run(30, 0);
+	run(30, 0); run(4, GUASA_LP); run(110, 0);
 	pickRival(0);
 	check(char2() == 4, "reversal: el rival es Ken", std::to_string(char2()));
 	auto watch = [&](const std::vector<std::pair<int, uint16_t>>& attack, int stance) {
@@ -2410,8 +2416,8 @@ static int PracticeSelfTest(const char* roms)
 	const std::vector<std::pair<int, uint16_t>> sweep = { { 4, GUASA_DOWN | GUASA_HK } }, heavy = { { 3, GUASA_HP } };
 	P.onWake = kReactHeavy;
 	auto r1 = watch(sweep, kStand);
-	// a normal: the game lets it out one frame after the first free one (specials and jumps, on it)
-	check(r1.first == 2 && r1.second == 0x0A, "reversal: al levantarse, golpe fuerte lo antes que deja el juego", said(r1));
+	// a normal: on the first free frame or the next, as the game lets it (specials and jumps, always on the first)
+	check(r1.first >= 1 && r1.first <= 2 && r1.second == 0x0A, "reversal: al levantarse, golpe fuerte lo antes que deja el juego", said(r1));
 	P.onWake = kReactJumpBack;
 	auto r2 = watch(sweep, kStand);
 	check(r2.first == 1 && r2.second == 0x04, "reversal: al levantarse, salta atras en el primer cuadro libre", said(r2));

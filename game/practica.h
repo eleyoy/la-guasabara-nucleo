@@ -165,6 +165,8 @@ private:
 	std::deque<std::vector<Box>> m_boxes = std::deque<std::vector<Box>>(3);   // the last 3 frames' boxes, oldest first
 	uint16_t m_held = 0;            // held since the last pick: kept from the game until released
 	bool m_grabHeld = false;
+	int m_pickLeft = 0;             // frames left for the old version's code after a pick
+	bool m_pickDirs = false;        // a direction came in that time: the code's button ends it
 	int m_lastLife[2] = { kFullLife, kFullLife }, m_still[2] = { 0, 0 };
 	int m_blockFor = 0;
 	bool m_tapeOnRight = true;

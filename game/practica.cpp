@@ -5,6 +5,11 @@
 #include "guasa_core.h"
 
 static const uint16_t kButtons = GUASA_LP | GUASA_MP | GUASA_HP | GUASA_LK | GUASA_MK | GUASA_HK;
+static const uint16_t kDirs = GUASA_UP | GUASA_DOWN | GUASA_LEFT | GUASA_RIGHT;
+// After picking a character, the frames its old version's code can still come in
+// (directions, then Jab, while the plane flies), on the same side, before the
+// control goes to the other pick.
+static const int kOldCodeFrames = 100;
 
 const char* StanceName(int s)
 {
@@ -401,16 +406,20 @@ void Practice::Inputs(uint16_t local, int second, uint16_t out[2])
 	if (m_grabHeld) { m_held = local; m_grabHeld = false; }
 	m_held &= local;
 	uint16_t fresh = local & ~m_held;
-	if (phase == PickMine) {
-		out[0] = fresh;
-		if (pressed & kButtons) { phase = PickRival; m_held = local; }
-		return;
-	}
-	if (phase == PickRival) {
-		out[1] = fresh;
-		if (pressed & kButtons) phase = WaitFight;
-		return;
-	}
+	// Picking (the player's character, then the rival's): the press that picks it
+	// stays on that side a moment, for the old version's code; the code done (some
+	// direction, then a button) or the time up, on to the next.
+	auto picking = [&](int side, Phase then) {
+		out[side] = fresh;
+		if (!m_pickLeft) {
+			if (pressed & kButtons) { m_pickLeft = kOldCodeFrames; m_pickDirs = false; }
+			return;
+		}
+		if (pressed & kDirs) m_pickDirs = true;
+		if ((m_pickDirs && (pressed & kButtons)) || --m_pickLeft == 0) { phase = then; m_held = local; m_pickLeft = 0; }
+	};
+	if (phase == PickMine) { picking(0, PickRival); return; }
+	if (phase == PickRival) { picking(1, WaitFight); return; }
 	if (controlRival) {
 		out[1] = local;
 		if (rec == Recording) tape.push_back(local);
@@ -522,6 +531,7 @@ void Practice::ChangeCharacters()
 	if (m_select.empty()) return;
 	guasa_load(m_select.data(), m_select.size());
 	phase = PickMine;
+	m_pickLeft = 0;
 	m_grabHeld = true;
 	m_spot.clear();
 	tape.clear();
@@ -535,6 +545,7 @@ void Practice::ChangeCharacters()
 
 std::string Practice::Status() const
 {
+	if (m_pickLeft) return "Para la version old, mete su codigo ahora (direcciones y Jab)";
 	if (phase == PickMine) return "Elige tu personaje";
 	if (phase == PickRival) return "Ahora elige el del rival (con el mismo control)";
 	if (phase == WaitFight) return "PRACTICA";
