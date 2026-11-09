@@ -2225,7 +2225,14 @@ static int ChallengerSound(const char* roms, const char* out)
 static int ControlsScreen(const std::string& shots)
 {
 	if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
-	g_win = SDL_CreateWindow("La Guasabara - Controles", (int)ControlsPanel::W, (int)ControlsPanel::H, SDL_WINDOW_RESIZABLE);
+	// big: 85% of the screen's usable part, with its shape (1000 x 660)
+	int ww = (int)ControlsPanel::W, wh = (int)ControlsPanel::H;
+	SDL_Rect use;
+	if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &use)) {
+		float k = SDL_min(use.w * 0.85f / ControlsPanel::W, use.h * 0.85f / ControlsPanel::H);
+		if (k > 1) { ww = (int)(ControlsPanel::W * k); wh = (int)(ControlsPanel::H * k); }
+	}
+	g_win = SDL_CreateWindow("La Guasabara - Controles", ww, wh, SDL_WINDOW_RESIZABLE);
 	g_ren = g_win ? SDL_CreateRenderer(g_win, NULL) : NULL;
 	if (!g_ren) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
 	SDL_SetRenderVSync(g_ren, 1);
