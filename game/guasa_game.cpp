@@ -471,6 +471,12 @@ struct ControlsPanel {
 		say(std::string(kActionNames[listen]) + ": " + BindText(b));
 		advance(listen);
 	}
+	void clear(int a)   // an action left empty
+	{
+		cur.b[a] = Bind{ 0, 0, 0, 0 };
+		save();
+		say(std::string(kActionNames[a]) + ": sin asignar");
+	}
 	void step(int d)
 	{
 		std::vector<std::string> ids{ "teclado" };
@@ -503,12 +509,23 @@ struct ControlsPanel {
 		                     : ev.type == SDL_EVENT_JOYSTICK_AXIS_MOTION ? ev.jaxis.which : 0;
 		if (which) for (auto& d : g_devs) if (SDL_GetJoystickID(d.joy) == which) from = d.id;
 		if (listen >= 0) {
+			if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && devId != "teclado" &&
+			    (ev.key.scancode == SDL_SCANCODE_DELETE || ev.key.scancode == SDL_SCANCODE_BACKSPACE)) {   // empty (on the keyboard, Supr is a key to assign)
+				clear(listen);
+				advance(listen);
+				return true;
+			}
 			if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.scancode == SDL_SCANCODE_ESCAPE) {
 				if (guided) advance(listen);   // paso a paso: Esc leaves this one as it is and goes on
 				else { listen = -1; say("Cancelado"); }
 				return true;
 			}
-			if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) { listen = -1; guided = false; return true; }
+			if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+				listen = -1;
+				guided = false;
+				if (ev.button.button == SDL_BUTTON_RIGHT) { int a = spotAt(ev.button.x, ev.button.y); if (a >= 0) clear(a); }
+				return true;
+			}
 			if (devId == "teclado") {
 				if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) assign(Bind{ 'k', (int)ev.key.scancode, 1, 0 });
 				return true;
@@ -541,11 +558,15 @@ struct ControlsPanel {
 			case SDL_SCANCODE_TAB: case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_DOWN: focus = (focus + 1) % kActions; break;
 			case SDL_SCANCODE_LEFT: case SDL_SCANCODE_UP: focus = (focus + kActions - 1) % kActions; break;
 			case SDL_SCANCODE_RETURN: case SDL_SCANCODE_SPACE: listen = focus; heldAxis = -1; break;
-			case SDL_SCANCODE_DELETE: case SDL_SCANCODE_BACKSPACE: cur.b[focus] = Bind{ 0, 0, 0, 0 }; save(); say(std::string(kActionNames[focus]) + ": sin asignar"); break;
+			case SDL_SCANCODE_DELETE: case SDL_SCANCODE_BACKSPACE: clear(focus); break;
 			case SDL_SCANCODE_PAGEUP: step(-1); break;
 			case SDL_SCANCODE_PAGEDOWN: step(1); break;
 			default: break;
 			}
+		}
+		if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_RIGHT) {   // right click: leave it empty
+			int a = spotAt(ev.button.x, ev.button.y);
+			if (a >= 0) { focus = a; clear(a); }
 		}
 		if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_LEFT) {
 			float x = ev.button.x, y = ev.button.y;
@@ -646,9 +667,9 @@ struct ControlsPanel {
 		}
 		// the bottom: what's happening, and the buttons
 		std::string line = listen >= 0 && guided ? std::string("PASO A PASO ") + std::to_string(listen + 1) + "/" + std::to_string(kActions) + ": aprieta " + kActionNames[listen] + " (Esc: saltar)"
-		                 : listen >= 0 ? std::string("Aprieta lo que va en ") + kActionNames[listen] + "  (Esc: cancelar)"
+		                 : listen >= 0 ? std::string("Aprieta lo que va en ") + kActionNames[listen] + (devId == "teclado" ? "  (Esc: cancelar)" : "  (Supr: vacio, Esc: cancelar)")
 		                 : note.size() && SDL_GetTicksNS() - noteAt < 4000000000ULL ? note.substr(0, 52)
-		                 : "Clic: asignar   Supr: vaciar   Esc: cerrar";
+		                 : "Clic: asignar   Clic derecho o Supr: vaciar   Esc: cerrar";
 		Text(24, 620, 1, line.c_str(), listen >= 0 ? 255 : 200, listen >= 0 ? 120 : 200, listen >= 0 ? 170 : 210);
 		for (const SDL_FRect* r : { &steps, &reset, &done }) {
 			bool h = inside(*r, mx, my) || (r == &steps && guided);
@@ -1065,6 +1086,58 @@ static SDL_Texture* RankTexture(const std::string& rank)
 	return t;
 }
 
+// The letters of that bar: Roboto Bold, drawn once in a sheet (tools/preparar_fuente.py,
+// controles/fuente.png and fuente.txt) and put together here, smooth at any size.
+struct Glyph { float x, y, w, h, xo, yo, adv; };
+static struct SheetFont {
+	bool tried = false, ok = false;
+	float size = 48, line = 57;
+	Glyph g[128] = {};
+	void Load()
+	{
+		if (tried) return;
+		tried = true;
+		std::string base = std::string(SDL_GetBasePath()) + "controles/";
+		FILE* f = fopen((base + "fuente.txt").c_str(), "r");
+		if (!f) return;
+		char buf[200];
+		while (fgets(buf, sizeof(buf), f)) {
+			int c;
+			Glyph x;
+			float asc;
+			if (sscanf(buf, "linea %f %f", &line, &asc) == 2) continue;
+			if (sscanf(buf, "%d %f %f %f %f %f %f %f", &c, &x.x, &x.y, &x.w, &x.h, &x.xo, &x.yo, &x.adv) == 8 && c >= 32 && c < 128) g[c] = x;
+		}
+		fclose(f);
+		ok = ControlTexture("fuente") != NULL;
+	}
+	// width of text at px tall letters (the sheet's size)
+	float Width(const std::string& t, float px)
+	{
+		float w = 0;
+		for (unsigned char c : t) if (c >= 32 && c < 128) w += g[c].adv;
+		return w * px / size;
+	}
+	// text with the top of its line at y; px: the font's size on screen
+	void Draw(float x, float y, float px, const std::string& t, Uint8 r, Uint8 gg, Uint8 b)
+	{
+		SDL_Texture* tex = ControlTexture("fuente");
+		if (!tex) return;
+		float k = px / size;
+		SDL_SetTextureColorMod(tex, r, gg, b);
+		for (unsigned char c : t) {
+			if (c < 32 || c >= 128) continue;
+			const Glyph& q = g[c];
+			if (q.w > 0) {
+				SDL_FRect src{ q.x, q.y, q.w, q.h }, dst{ x + q.xo * k, y + q.yo * k, q.w * k, q.h * k };
+				SDL_RenderTexture(g_ren, tex, &src, &dst);
+			}
+			x += q.adv * k;
+		}
+		SDL_SetTextureColorMod(tex, 255, 255, 255);
+	}
+} g_font;
+
 // Under the top line, in the middle, like Fightcade's: "photo name 2 VS 1 name
 // photo" (player 1 on the left), the score in the set's color. Without a photo,
 // the rank's badge.
@@ -1076,16 +1149,23 @@ static void DrawNames(const SDL_FRect& r)
 		for (int p = 0; p < 2; p++) { names[p] = Plain(g_names[p]); ranks[p] = g_ranks[p]; photos[p] = g_photos[p]; }
 	}
 	if (names[0].empty() && names[1].empty()) return;
-	float s = r.h / 450 > 1 ? r.h / 450 : 1, ts = s * 1.5f, h = 24 * s, pic = h - 4 * s, gap = 8 * s;
+	g_font.Load();
+	float s = r.h / 450 > 1 ? r.h / 450 : 1, h = 26 * s, pic = h - 4 * s, gap = 8 * s;
+	float px = 21 * s;   // the letters' size
 	char sc[2][8];
 	for (int p = 0; p < 2; p++) snprintf(sc[p], sizeof(sc[p]), "%d", SDL_max((int)g_score[p], 0));
-	float cw = 8 * ts;   // one character
-	float w = 2 * (pic + gap) + (names[0].size() + names[1].size()) * cw + (strlen(sc[0]) + strlen(sc[1]) + 2) * cw + 6 * gap + 2 * gap;
-	SDL_FRect box{ r.x + r.w / 2 - w / 2, r.y + 15 * s, w, h };
+	auto width = [&](const char* t) { return g_font.ok ? g_font.Width(t, px) : strlen(t) * 8 * 1.5f * s; };
+	// the VS in the middle of the game, over the K.O., always; each side grows away
+	// from it, and the bar is as wide as the longer side on both
+	float mid = r.x + r.w / 2, vs = width("VS");
+	float side[2];
+	for (int p = 0; p < 2; p++) side[p] = pic + gap + width(names[p].c_str()) + gap + width(sc[p]) + gap;
+	float half = vs / 2 + SDL_max(side[0], side[1]) + gap;
+	SDL_FRect box{ mid - half, r.y + 15 * s, 2 * half, h };
 	SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
 	SDL_SetRenderDrawColor(g_ren, 8, 10, 16, 200);
 	SDL_RenderFillRect(g_ren, &box);
-	float x = box.x + gap, ty = box.y + (h - 8 * ts) / 2;
+	float x = mid - vs / 2 - side[0], ty = box.y + (h - (g_font.ok ? g_font.line * px / g_font.size : 12 * s)) / 2;
 	auto face = [&](int p) {
 		SDL_FRect f{ x, box.y + 2 * s, pic, pic };
 		SDL_Texture* t = PhotoTexture(photos[p]);
@@ -1093,13 +1173,19 @@ static void DrawNames(const SDL_FRect& r)
 		if (t) SDL_RenderTexture(g_ren, t, NULL, &f);
 		x += pic + gap;
 	};
-	auto word = [&](const char* text, Uint8 cr, Uint8 cg, Uint8 cb) { Text(x, ty, ts, text, cr, cg, cb); x += strlen(text) * cw + gap; };
+	auto word = [&](const char* text, Uint8 cr, Uint8 cg, Uint8 cb) {
+		if (g_font.ok) g_font.Draw(x, ty, px, text, cr, cg, cb);
+		else Text(x, ty, 1.5f * s, text, cr, cg, cb);   // without the sheet, the plain letters
+		x += width(text) + gap;
+	};
 	Uint8 nr, ng, nb;
 	face(0);
 	NameColor(g_names[0], nr, ng, nb);
 	word(names[0].c_str(), nr, ng, nb);
 	word(sc[0], 80, 210, 230);
+	x = mid - vs / 2;
 	word("VS", 150, 150, 160);
+	x = mid + vs / 2 + gap;
 	word(sc[1], 80, 210, 230);
 	NameColor(g_names[1], nr, ng, nb);
 	word(names[1].c_str(), nr, ng, nb);
@@ -2618,8 +2704,10 @@ static int PlayReplay(const char* roms, const char* file, const std::string& sho
 
 // espectar: a set as it's played. The frames come on stdin from the app (which
 // gets them from the hub, sent by player 1's game); the game here runs them about
-// two seconds behind. Joining late, it catches up fast without drawing. Keeps the
-// score by counting the games each one wins.
+// two seconds behind. Joining late (or falling more than 3 seconds behind), it
+// catches up hidden, as fast as the PC goes, on a dark screen that says how far
+// it is, and then shows the set where it is, at normal speed: never fast motion.
+// Keeps the score by counting the games each one wins.
 static int Spectate(const char* roms, bool pause, const std::string& shots = "")
 {
 	char msg[300] = "";
@@ -2657,6 +2745,9 @@ static int Spectate(const char* roms, bool pause, const std::string& shots = "")
 	}).detach();
 
 	const size_t kBehind = (size_t)(2 * guasa_fps());   // about two seconds behind the players
+	const size_t kJump = (size_t)(3 * guasa_fps());     // more than this behind that: catch up hidden
+	bool catching = false;
+	size_t catchFrom = 0;                                // where the catching up started, for its percentage
 	size_t i = 0;
 	PauseState ps;
 	ResultWatcher results;
@@ -2690,18 +2781,17 @@ static int Spectate(const char* roms, bool pause, const std::string& shots = "")
 		{ std::lock_guard<std::mutex> l(lock); have = live.frames.size(); }
 		bool ended = over;
 		size_t target = ended ? have : have > kBehind ? have - kBehind : 0;
-		bool catching = target > i + 300;   // far behind (joined late): fast, without drawing
-		if (catching) {
-			for (int k = 0; k < 600 && i + 1 < target; k++) step(false);
-			step(true);
+		if (!catching && target > i + kJump) { catching = true; catchFrom = i; }
+		if (catching) {   // hidden and as fast as it goes, a slice at a time so the window stays alive
+			Uint64 until = SDL_GetTicksNS() + 25000000ULL;
+			while (i + 1 < target && SDL_GetTicksNS() < until) step(false);
+			if (i + 1 >= target) { step(true); catching = false; next = SDL_GetTicksNS(); }   // there: from here, normal speed
 		} else if (i < target) {
-			bool moved = step(true);
-			if (i + 60 < target) step(true);   // a bit behind: a little faster
-			else if (moved) PushAudio();
+			if (step(true)) PushAudio();
 		}
 		std::string banner;
 		if (have == 0) banner = "ESPECTAR\nEsperando los primeros cuadros del set...";
-		else if (catching) banner = "ALCANZANDO EL SET\nUn momento: se pone al dia sin dibujar";
+
 		else if (ended && i >= have) {
 			if (!endedAt) endedAt = SDL_GetTicksNS();
 			banner = "FIN DEL SET\nEsc: salir";
@@ -2710,8 +2800,26 @@ static int Spectate(const char* roms, bool pause, const std::string& shots = "")
 		uint16_t raw[2] = { 0, 0 };
 		if (i > 0) { std::lock_guard<std::mutex> l(lock); raw[0] = (uint16_t)(live.frames[i - 1] & ~kPauseBit); raw[1] = (uint16_t)((live.frames[i - 1] >> 16) & ~kPauseBit); }
 		g_overlay = [&](const SDL_FRect& r) {
-			DrawNames(r);
 			float s = r.h / 450 > 1 ? r.h / 450 : 1;
+			if (catching) {   // dark, with how far it is: the game isn't shown until it's where the set is
+				SDL_SetRenderDrawColor(g_ren, 8, 10, 16, 255);
+				SDL_RenderFillRect(g_ren, &r);
+				int pct = target > catchFrom ? (int)(100.0 * (i - catchFrom) / (target - catchFrom)) : 100;
+				char t[64];
+				snprintf(t, sizeof(t), "%d%%", pct);
+				Text(r.x + r.w / 2 - strlen("CARGANDO SET EN VIVO") * 8 * s, r.y + r.h / 2 - 30 * s, 2 * s, "CARGANDO SET EN VIVO", 255, 46, 136);   // centered
+				Text(r.x + r.w / 2 - strlen(t) * 12 * s, r.y + r.h / 2, 3 * s, t, 235, 235, 240);
+				SDL_FRect track{ r.x + r.w / 2 - 150 * s, r.y + r.h / 2 + 36 * s, 300 * s, 6 * s }, fill = track;
+				fill.w = track.w * pct / 100;
+				SDL_SetRenderDrawColor(g_ren, 40, 42, 54, 255);
+				SDL_RenderFillRect(g_ren, &track);
+				SDL_SetRenderDrawColor(g_ren, 255, 46, 136, 255);
+				SDL_RenderFillRect(g_ren, &fill);
+				return;
+			}
+			g_score[0] = score[0];   // the bar shows the score this window counts
+			g_score[1] = score[1];
+			DrawNames(r);
 			char line[160];
 			snprintf(line, sizeof(line), "EN VIVO   %d - %d   %s   F2 botones   Esc dejar de ver", score[0], score[1], Clock(i).c_str());
 			SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
@@ -2726,7 +2834,11 @@ static int Spectate(const char* roms, bool pause, const std::string& shots = "")
 		};
 		Present(showInputs ? raw : NULL, banner.empty() ? NULL : banner.c_str());
 		static bool shot = false;   // captura=<folder>: one picture once it plays live
-		if (!shots.empty() && !shot && i > 900 && !catching) { SaveWindow(shots + "/espectar.bmp"); shot = true; }
+		static size_t liveAt = 0;   // the frame it got to the set live (the picture, a second after)
+		if (!catching && !liveAt && i > 900) liveAt = i;
+		if (!shots.empty() && !shot && liveAt && i > liveAt + 60) { SaveWindow(shots + "/espectar.bmp"); shot = true; printf("en vivo en el cuadro %zu de %zu\n", i, have); fflush(stdout); }
+		static bool shotCatch = false;   // and one while it catches up
+		if (!shots.empty() && !shotCatch && catching && i > catchFrom + 1500) { SaveWindow(shots + "/espectar-llegando.bmp"); shotCatch = true; }
 		next += frameNs;
 		Uint64 now = SDL_GetTicksNS();
 		if (next > now) SDL_DelayPrecise(next - now);
